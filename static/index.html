@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Erickson Search</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #6b6b6b; --line: #e4e4e4;
+    --link: #1a4fd6; --url: #1f7a3a; --accent: #1a4fd6; --field: #f5f5f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121212; --fg: #e8e8e8; --muted: #9a9a9a; --line: #2a2a2a;
+      --link: #8ab4ff; --url: #6fcf8e; --accent: #8ab4ff; --field: #1e1e1e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 0 16px 64px; }
+  header { padding: 28vh 0 24px; text-align: center; transition: padding .2s; }
+  body.has-results header { padding: 24px 0 8px; text-align: left; display: flex; gap: 16px; align-items: center; }
+  h1 { margin: 0 0 20px; font-size: 40px; letter-spacing: -0.02em; font-weight: 700; }
+  body.has-results h1 { font-size: 22px; margin: 0; cursor: pointer; white-space: nowrap; }
+  form { flex: 1; display: flex; }
+  input { flex: 1; min-width: 0; font: inherit; padding: 12px 18px; border-radius: 999px;
+          border: 1px solid var(--line); background: var(--field); color: var(--fg); outline: none; }
+  input:focus { border-color: var(--accent); }
+  #meta { color: var(--muted); font-size: 13px; margin: 8px 0 20px; min-height: 1em; }
+  .hit { margin: 0 0 26px; }
+  .hit .url { color: var(--url); font-size: 13px; overflow-wrap: anywhere; }
+  .hit a { color: var(--link); font-size: 19px; text-decoration: none; display: block; }
+  .hit a:hover { text-decoration: underline; }
+  .hit p { margin: 4px 0 0; color: var(--fg); font-size: 14.5px; overflow-wrap: anywhere; }
+  .hit b { font-weight: 650; }
+  nav { display: flex; gap: 12px; }
+  nav[hidden] { display: none; }
+  nav button { font: inherit; padding: 8px 16px; border-radius: 999px; border: 1px solid var(--line);
+               background: var(--field); color: var(--fg); cursor: pointer; }
+  nav button:disabled { opacity: .4; cursor: default; }
+  #stats { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="logo">Erickson</h1>
+    <form id="f"><input id="q" name="q" autocomplete="off" autofocus placeholder="Search the web" aria-label="Search"></form>
+  </header>
+  <div id="stats"></div>
+  <div id="meta"></div>
+  <div id="results"></div>
+  <nav id="nav" hidden><button id="prev">Previous</button><button id="next">Next</button></nav>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let page = 0;
+
+async function run(q, p, push) {
+  page = p;
+  if (!q.trim()) return;
+  document.body.classList.add("has-results");
+  $("stats").textContent = "";
+  if (push) history.pushState(null, "", `?q=${encodeURIComponent(q)}${p ? `&page=${p}` : ""}`);
+  document.title = `${q} - Erickson Search`;
+  const r = await fetch(`/api/search?q=${encodeURIComponent(q)}&page=${p}`).then(r => r.json());
+  $("meta").textContent = `About ${r.matched.toLocaleString()} results (${r.ms.toFixed(1)} ms)`;
+  const out = $("results");
+  out.replaceChildren();
+  for (const h of r.results) {
+    const d = document.createElement("div");
+    d.className = "hit";
+    const u = document.createElement("div");
+    u.className = "url";
+    u.textContent = h.url.replace(/^https?:\/\//, "");
+    const a = document.createElement("a");
+    if (/^https?:\/\//.test(h.url)) a.href = h.url;
+    a.textContent = h.title;
+    const s = document.createElement("p");
+    s.innerHTML = h.snippet; // escaped server-side; only <b> is markup
+    d.append(u, a, s);
+    out.append(d);
+  }
+  if (!r.results.length) out.textContent = "No results.";
+  $("nav").hidden = !r.results.length && p === 0;
+  $("prev").disabled = p === 0;
+  $("next").disabled = r.results.length < 10;
+  window.scrollTo(0, 0);
+}
+
+function fromUrl() {
+  const u = new URLSearchParams(location.search);
+  const q = u.get("q") || "";
+  $("q").value = q;
+  if (q) run(q, +(u.get("page") || 0), false);
+}
+
+$("f").onsubmit = e => { e.preventDefault(); run($("q").value, 0, true); };
+$("prev").onclick = () => run($("q").value, page - 1, true);
+$("next").onclick = () => run($("q").value, page + 1, true);
+$("logo").onclick = () => { location.href = "/"; };
+window.onpopstate = fromUrl;
+fromUrl();
+fetch("/api/stats").then(r => r.json()).then(s => {
+  if (!document.body.classList.contains("has-results"))
+    $("stats").textContent = `${s.pages.toLocaleString()} pages indexed`;
+  $("stats").style.textAlign = "center";
+});
+</script>
+</body>
+</html>

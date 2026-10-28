@@ -1,0 +1,56 @@
+# Evaluation queries. One per line; "nav:" marks navigational queries with one right answer.
+# Written before tuning so ranking changes are judged against a fixed set.
+
+nav: github
+nav: wikipedia
+nav: youtube
+nav: python
+nav: rust programming language
+nav: new york times
+nav: bbc news
+nav: stack overflow
+nav: mozilla firefox
+nav: amazon
+
+how does tcp work
+how to make sourdough bread
+what is a black hole
+symptoms of vitamin d deficiency
+how to change a car tire
+best way to learn programming
+what causes inflation
+how do vaccines work
+history of the roman empire
+how to lower blood pressure naturally
+what is machine learning
+how to write a cover letter
+difference between virus and bacteria
+how does photosynthesis work
+how to train a puppy
+what is the stock market
+climate change effects
+how to start a vegetable garden
+benefits of meditation
+how to fix a leaky faucet
+
+linux command line tutorial
+javascript async await
+sql join types
+docker vs virtual machine
+git rebase vs merge
+css flexbox guide
+kubernetes basics
+http status codes
+regular expressions tutorial
+binary search algorithm
+
+chocolate chip cookie recipe
+marathon training plan
+cheap flights europe
+used car buying tips
+home workout without equipment
+how to invest for beginners
+best hiking trails colorado
+wedding planning checklist
+remote work productivity tips
+electric car battery life

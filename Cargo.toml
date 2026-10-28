@@ -1,0 +1,13 @@
+[package]
+name = "erickson"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flate2 = "1"
+memmap2 = "0.9"
+tiny_http = "0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
