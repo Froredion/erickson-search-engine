@@ -360,6 +360,26 @@ pub fn publish(root: &Path, generation: &str) -> io::Result<()> {
     fs::rename(tmp, root.join("CURRENT"))
 }
 
+/// Deletes all but the newest `keep` generations, never the published one. A server that still
+/// has an old generation open keeps working: its mapped files stay valid until it lets go.
+pub fn prune(root: &Path, keep: usize) -> io::Result<Vec<String>> {
+    let current = fs::read_to_string(root.join("CURRENT")).unwrap_or_default().trim().to_owned();
+    let mut gens: Vec<String> = fs::read_dir(root)?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|n| n.starts_with("gen-"))
+        .collect();
+    gens.sort_unstable_by(|a, b| b.cmp(a));
+    let mut removed = Vec::new();
+    for g in gens.into_iter().skip(keep) {
+        if g != current {
+            fs::remove_dir_all(root.join(&g))?;
+            removed.push(g);
+        }
+    }
+    Ok(removed)
+}
+
 pub fn current(root: &Path) -> io::Result<PathBuf> {
     let generation = fs::read_to_string(root.join("CURRENT"))
         .map_err(|_| io::Error::other(format!("no published index in {}", root.display())))?;
