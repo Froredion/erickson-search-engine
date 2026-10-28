@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::ranks::host;
-use crate::segment::{self, strip_scheme, truncate, Segment};
+use crate::segment::{self, strip_scheme, truncate, Postings, Segment, BLOCK};
 use crate::tokenize::{query_terms, token_spans, tokens};
 
 /// BM25 term-frequency saturation (k1) and length normalization (b). Overridable with
@@ -58,11 +58,126 @@ pub struct Opts {
     /// At most this many results per host.
     pub per_host: Option<usize>,
     pub snippets: bool,
+    /// Score every posting instead of skipping with block-max WAND. Same results, slower; kept
+    /// to check that the skipping never changes an answer.
+    pub exhaustive: bool,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Self { coverage: true, rerank: true, per_host: Some(PER_HOST), snippets: true }
+        Self { coverage: true, rerank: true, per_host: Some(PER_HOST), snippets: true, exhaustive: false }
+    }
+}
+
+/// Upper bound of the static page prior, (0.6 + 0.8 * authority) * (0.5 + 0.5 * quality).
+const PRIOR_MAX: f32 = 1.4;
+
+fn page_prior(seg: &Segment, d: u32) -> f32 {
+    (0.6 + 0.8 * seg.authority(d)) * (0.5 + 0.5 * seg.quality(d))
+}
+
+/// One query term's position in one segment's postings, for block-max WAND.
+struct Cursor<'a> {
+    p: Postings<'a>,
+    /// Position of the term in the query.
+    term: usize,
+    /// The term's IDF.
+    w: f32,
+    /// Highest score any doc can get from this term in this segment.
+    max_score: f32,
+    decoded: usize,
+    docs: [u32; BLOCK],
+    tfs: [u32; BLOCK],
+    len: usize,
+    pos: usize,
+    /// Block the last `block_max` lookup landed in; only moves forward.
+    shallow: usize,
+    /// Current doc, or `u32::MAX` once the list is exhausted.
+    doc: u32,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(p: Postings<'a>, term: usize, w: f32, bound: &impl Fn(u32, u32) -> f32) -> Self {
+        let max_score = (0..p.n_blocks()).map(|b| {
+            let (tf, dl) = p.block_limits(b);
+            w * bound(tf, dl)
+        });
+        let mut c = Cursor {
+            p,
+            term,
+            w,
+            max_score: max_score.fold(0.0, f32::max),
+            decoded: 0,
+            docs: [0; BLOCK],
+            tfs: [0; BLOCK],
+            len: 0,
+            pos: 0,
+            shallow: 0,
+            doc: u32::MAX,
+        };
+        c.load(0);
+        c
+    }
+
+    fn load(&mut self, b: usize) {
+        self.len = self.p.decode_block(b, &mut self.docs, &mut self.tfs);
+        self.decoded = b;
+        self.shallow = self.shallow.max(b);
+        self.pos = 0;
+        self.doc = self.docs[0];
+    }
+
+    fn tf(&self) -> u32 {
+        self.tfs[self.pos]
+    }
+
+    fn next(&mut self) {
+        self.pos += 1;
+        if self.pos < self.len {
+            self.doc = self.docs[self.pos];
+        } else if self.decoded + 1 < self.p.n_blocks() {
+            self.load(self.decoded + 1);
+        } else {
+            self.doc = u32::MAX;
+        }
+    }
+
+    /// Moves to the first doc >= `target`, decoding only the block that holds it.
+    fn seek(&mut self, target: u32) {
+        if self.doc >= target {
+            return;
+        }
+        let n = self.p.n_blocks();
+        let mut b = self.decoded;
+        while b < n && self.p.last_doc(b) < target {
+            b += 1;
+        }
+        if b == n {
+            self.doc = u32::MAX;
+            return;
+        }
+        if b != self.decoded {
+            self.load(b);
+        }
+        while self.docs[self.pos] < target {
+            self.pos += 1;
+        }
+        self.doc = self.docs[self.pos];
+    }
+
+    /// Best score this term can give any doc in the block holding `target`, and that block's
+    /// last doc. Reads only the block directory.
+    fn block_max(&mut self, target: u32, bound: &impl Fn(u32, u32) -> f32) -> (f32, u32) {
+        let n = self.p.n_blocks();
+        while self.shallow < n && self.p.last_doc(self.shallow) < target {
+            self.shallow += 1;
+        }
+        if self.shallow == n {
+            // The list ends before `target`: this term can't contribute there.
+            return (0.0, u32::MAX);
+        }
+        let (tf, dl) = self.p.block_limits(self.shallow);
+        (self.w * bound(tf, dl), self.p.last_doc(self.shallow))
     }
 }
 
@@ -75,7 +190,7 @@ struct Cand {
 
 impl PartialEq for Cand {
     fn eq(&self, o: &Self) -> bool {
-        self.score == o.score
+        self.cmp(o) == Ordering::Equal
     }
 }
 impl Eq for Cand {}
@@ -84,17 +199,18 @@ impl PartialOrd for Cand {
         Some(self.cmp(o))
     }
 }
-/// Reversed, so a `BinaryHeap<Cand>` keeps the lowest score on top.
+/// "Better first": higher score, then lower (segment, doc) so ties break the same way however
+/// the candidates were found. A `BinaryHeap<Cand>` therefore keeps the worst one on top.
 impl Ord for Cand {
     fn cmp(&self, o: &Self) -> Ordering {
-        o.score.total_cmp(&self.score)
+        o.score.total_cmp(&self.score).then((self.seg, self.doc).cmp(&(o.seg, o.doc)))
     }
 }
 
 fn push_top(heap: &mut BinaryHeap<Cand>, c: Cand, cap: usize) {
     if heap.len() < cap {
         heap.push(c);
-    } else if heap.peek().is_some_and(|min| c.score > min.score) {
+    } else if heap.peek().is_some_and(|worst| c < *worst) {
         heap.pop();
         heap.push(c);
     }
@@ -160,7 +276,13 @@ impl Index {
                 .map(|from| {
                     let (terms, idf) = (&terms, &idf);
                     let to = (from + chunk).min(self.segs.len());
-                    s.spawn(move || self.score_shards(from, to, terms, idf, opts.coverage))
+                    s.spawn(move || {
+                        if opts.exhaustive {
+                            self.score_shards(from, to, terms, idf, opts.coverage)
+                        } else {
+                            self.wand_shards(from, to, terms, idf, opts.coverage)
+                        }
+                    })
                 })
                 .collect();
             let mut heap = BinaryHeap::with_capacity(CANDIDATES + 1);
@@ -187,7 +309,7 @@ impl Index {
                 (c.score * rerank(url, title, text, &terms, &term_set), c)
             })
             .collect();
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then((a.1.seg, a.1.doc).cmp(&(b.1.seg, b.1.doc))));
 
         let mut per_host: HashMap<&str, usize> = HashMap::new();
         let (mut hits, mut skipped) = (Vec::new(), 0);
@@ -255,8 +377,116 @@ impl Index {
                 matched += 1;
                 let di = d as usize;
                 let coverage = if use_coverage { (covered[di] / total_idf).powi(3) } else { 1.0 };
-                let prior = (0.6 + 0.8 * seg.authority(d)) * (0.5 + 0.5 * seg.quality(d));
+                let prior = page_prior(seg, d);
                 push_top(&mut heap, Cand { score: acc[di] * coverage * prior, seg: si as u32, doc: d }, CANDIDATES);
+            }
+        }
+        (heap.into_vec(), matched)
+    }
+}
+
+impl Index {
+    /// The same first-stage score as `score_shards`, computed with block-max WAND: docs are
+    /// visited in id order across all query terms, and any doc or block whose upper bound can't
+    /// beat the current top-`CANDIDATES` threshold is skipped without being decoded. Coverage makes
+    /// the bound tight: a doc missing the rare terms can't reach the threshold at all.
+    ///
+    /// `matched` is a lower bound here (the largest single-term df per shard), since skipped docs
+    /// are never counted.
+    fn wand_shards(&self, from: usize, to: usize, terms: &[String], idf: &[f32], use_coverage: bool) -> (Vec<Cand>, u64) {
+        let mut heap = BinaryHeap::with_capacity(CANDIDATES + 1);
+        let mut matched = 0u64;
+        let total_idf: f32 = idf.iter().sum::<f32>().max(f32::MIN_POSITIVE);
+        let (k1, b) = bm25_params();
+        let avgdl = self.avgdl;
+        let tf_part = |tf: f32, dl: f32| tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * dl / avgdl));
+        let bound = |tf: u32, dl: u32| tf_part(tf as f32, dl as f32);
+        let coverage = |covered: f32| if use_coverage { (covered / total_idf).powi(3) } else { 1.0 };
+
+        for si in from..to {
+            let seg = &self.segs[si];
+            let mut cs: Vec<Cursor> = terms
+                .iter()
+                .zip(idf)
+                .filter(|(_, &w)| w > 0.0)
+                .enumerate()
+                .filter_map(|(term, (t, &w))| seg.lookup(t).map(|p| Cursor::new(p, term, w, &bound)))
+                .collect();
+            matched += cs.iter().map(|c| c.p.df as u64).max().unwrap_or(0);
+
+            loop {
+                cs.retain(|c| c.doc != u32::MAX);
+                if cs.is_empty() {
+                    break;
+                }
+                cs.sort_unstable_by_key(|c| c.doc);
+                // A doc that only ties the threshold can still get in on a lower doc id, so
+                // skipping requires a bound strictly below it.
+                let threshold = if heap.len() < CANDIDATES { 0.0 } else { heap.peek().map_or(0.0, |c: &Cand| c.score) };
+
+                // Pivot: the first position where the terms so far could reach the threshold.
+                let (mut max_sum, mut idf_sum, mut pivot) = (0.0, 0.0, None);
+                for (i, c) in cs.iter().enumerate() {
+                    max_sum += c.max_score;
+                    idf_sum += c.w;
+                    if PRIOR_MAX * coverage(idf_sum) * max_sum >= threshold {
+                        pivot = Some(i);
+                        break;
+                    }
+                }
+                let Some(mut last) = pivot else { break };
+                let d = cs[last].doc;
+                while last + 1 < cs.len() && cs[last + 1].doc == d {
+                    last += 1;
+                }
+
+                // Tighter check with the maxima of the blocks that actually hold `d`.
+                let (mut block_sum, mut idf_sum, mut skip_to) = (0.0, 0.0, u32::MAX);
+                for c in cs[..=last].iter_mut() {
+                    let (m, block_last) = c.block_max(d, &bound);
+                    block_sum += m;
+                    idf_sum += c.w;
+                    skip_to = skip_to.min(block_last.saturating_add(1));
+                }
+                if PRIOR_MAX * coverage(idf_sum) * block_sum < threshold {
+                    // Nothing before the end of the shortest of these blocks can make it, and
+                    // terms after the pivot haven't reached `d` yet.
+                    if let Some(c) = cs.get(last + 1) {
+                        skip_to = skip_to.min(c.doc);
+                    }
+                    for c in cs[..=last].iter_mut() {
+                        c.seek(skip_to);
+                    }
+                    continue;
+                }
+
+                if cs[0].doc == d {
+                    if !seg.is_deleted(d) {
+                        // Summed in query-term order, exactly as `score_shards` does, so both
+                        // paths produce bit-identical scores.
+                        let dl = seg.doc_len(d) as f32;
+                        let mut parts = [(0usize, 0.0f32, 0.0f32); 12];
+                        for (slot, c) in parts.iter_mut().zip(&cs[..=last]) {
+                            *slot = (c.term, c.w * tf_part(c.tf() as f32, dl), c.w);
+                        }
+                        let parts = &mut parts[..=last];
+                        parts.sort_unstable_by_key(|p| p.0);
+                        let (mut s, mut covered) = (0.0, 0.0);
+                        for &(_, contribution, w) in parts.iter() {
+                            s += contribution;
+                            covered += w;
+                        }
+                        let score = s * coverage(covered) * page_prior(seg, d);
+                        push_top(&mut heap, Cand { score, seg: si as u32, doc: d }, CANDIDATES);
+                    }
+                    for c in cs[..=last].iter_mut() {
+                        c.next();
+                    }
+                } else {
+                    for c in cs[..last].iter_mut() {
+                        c.seek(d);
+                    }
+                }
             }
         }
         (heap.into_vec(), matched)

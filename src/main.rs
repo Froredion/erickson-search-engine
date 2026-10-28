@@ -19,15 +19,15 @@ const USAGE: &str = "usage:
                    [--resume] [--no-dedup] [--no-publish] [--keep 2]
                    (WET_FILES... | --paths wet.paths [--limit N] [--fetch https|s3] [--work DIR])
   erickson ingest-tsv --index DIR [--shard-size 100000] [--threads N] PASSAGES.tsv   (id<TAB>text per line)
-  erickson bench   --index DIR --queries QUERIES.tsv --qrels QRELS [--rel 1] [--run OUT.run]
+  erickson bench   --index DIR --queries QUERIES.tsv --qrels QRELS [--rel 1] [--run OUT.run] [--exhaustive]
   erickson serve   --index DIR [--port 8080]
   erickson query   --index DIR QUERY...
-  erickson eval    --index DIR QUERIES_FILE
+  erickson eval    --index DIR QUERIES_FILE [--exhaustive]
   erickson publish --index DIR GENERATION
   erickson stats   --index DIR";
 
 /// Flags that take no value.
-const SWITCHES: [&str; 3] = ["no-publish", "resume", "no-dedup"];
+const SWITCHES: [&str; 4] = ["no-publish", "resume", "no-dedup", "exhaustive"];
 
 pub struct Args {
     flags: HashMap<String, String>,
@@ -122,7 +122,7 @@ fn bench(a: &Args) -> io::Result<()> {
         .collect();
     println!("{} judged queries, {} pages in index\n", queries.len(), ix.n_docs);
 
-    let off = search::Opts { coverage: false, rerank: false, per_host: None, snippets: false };
+    let off = search::Opts { coverage: false, rerank: false, per_host: None, snippets: false, exhaustive: a.has("exhaustive") };
     let variants = [
         ("BM25 only", off),
         ("+ coverage", search::Opts { coverage: true, ..off }),
@@ -197,7 +197,7 @@ fn eval(a: &Args) -> io::Result<()> {
             continue;
         }
         let q = line.strip_prefix("nav:").unwrap_or(line).trim();
-        let r = ix.search(q, 3, 0);
+        let r = ix.search_with(q, 3, 0, search::Opts { exhaustive: a.has("exhaustive"), ..Default::default() });
         latencies.push(r.micros);
         println!("\x1b[1m{q}\x1b[0m  ({:.1} ms, {} matches)", r.micros as f64 / 1000.0, r.matched);
         for h in &r.hits {

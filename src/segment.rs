@@ -4,12 +4,19 @@
 //! Files in a segment directory:
 //!   terms.bin     term bytes, concatenated in sorted order
 //!   terms.idx     28 bytes per term: term offset u64, term len u32, df u32, postings offset u64, postings len u32
-//!   postings.bin  per term: varint (doc delta, weighted tf) pairs
+//!   postings.bin  per term: a block directory, then the blocks (see below)
 //!   docmeta.bin   12 bytes per doc: body length u32, quality f32, authority f32
 //!   store.bin     per doc: url, title, text, each as u32 length + bytes
 //!   store.idx     u64 offset into store.bin per doc
 //!   deleted.bin   u32 ids of docs removed by deduplication (optional)
-//!   meta.txt      "<docs> <total body length>"
+//!   fingerprints.bin  dedup records, one per doc (see `dedup`)
+//!   meta.txt      "<docs> <total body length> <format version>"
+//!
+//! A term's postings are split into blocks of 128 (doc, weighted tf) pairs, varint-encoded with
+//! doc ids delta-coded. The directory in front holds 16 bytes per block: last doc id, payload
+//! offset, max tf and min doc length in the block. Those last two bound the best BM25 score any
+//! doc in the block can reach, whatever k1 and b are, which lets queries skip whole blocks
+//! (block-max WAND) and jump straight to the block holding a given doc.
 //!
 //! Segments live in a generation directory (`gen-0001/`). A generation only becomes visible to
 //! queries once it's complete and `CURRENT` points at it.
@@ -24,6 +31,9 @@ use crate::tokenize::tokens;
 
 const ENTRY: usize = 28;
 const META: usize = 12;
+pub const BLOCK: usize = 128;
+const DIR_ENTRY: usize = 16;
+const FORMAT: &str = "2";
 const STORED_TEXT_BYTES: usize = 4096;
 /// Term frequency weights per field: a word in the title or URL counts as several in the body.
 const TITLE_WEIGHT: u32 = 3;
@@ -153,15 +163,27 @@ impl SegmentWriter {
         let mut idx = BufWriter::new(File::create(self.dir.join("terms.idx"))?);
         let mut post = BufWriter::new(File::create(self.dir.join("postings.bin"))?);
         let (mut term_off, mut post_off) = (0u64, 0u64);
-        let mut buf = Vec::new();
+        let (mut buf, mut payload) = (Vec::new(), Vec::new());
         for (term, p) in &terms {
             buf.clear();
+            payload.clear();
             let mut prev = 0;
-            for pair in p.chunks_exact(2) {
-                varint(&mut buf, pair[0] - prev);
-                varint(&mut buf, pair[1]);
-                prev = pair[0];
+            for block in p.chunks(2 * BLOCK) {
+                let offset = payload.len() as u32;
+                let (mut max_tf, mut min_dl) = (0u32, u32::MAX);
+                for pair in block.chunks_exact(2) {
+                    let (doc, tf) = (pair[0], pair[1]);
+                    varint(&mut payload, doc - prev);
+                    varint(&mut payload, tf);
+                    prev = doc;
+                    max_tf = max_tf.max(tf);
+                    min_dl = min_dl.min(u32_at(&self.meta, doc as usize * META));
+                }
+                for v in [prev, offset, max_tf, min_dl] {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
             }
+            buf.extend_from_slice(&payload);
             blob.write_all(term.as_bytes())?;
             post.write_all(&buf)?;
             idx.write_all(&term_off.to_le_bytes())?;
@@ -179,7 +201,7 @@ impl SegmentWriter {
         fs::write(self.dir.join("docmeta.bin"), &self.meta)?;
         let offsets: Vec<u8> = self.store_offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
         fs::write(self.dir.join("store.idx"), offsets)?;
-        fs::write(self.dir.join("meta.txt"), format!("{} {}\n", self.n_docs, self.total_len))
+        fs::write(self.dir.join("meta.txt"), format!("{} {} {FORMAT}\n", self.n_docs, self.total_len))
     }
 
     pub fn abandon(self) -> io::Result<()> {
@@ -219,18 +241,48 @@ fn read_field<'a>(store: &'a [u8], o: &mut usize) -> &'a str {
     s
 }
 
+#[derive(Clone, Copy)]
 pub struct Postings<'a> {
     pub df: u32,
     data: &'a [u8],
 }
 
 impl Postings<'_> {
+    pub fn n_blocks(&self) -> usize {
+        (self.df as usize).div_ceil(BLOCK)
+    }
+
+    pub fn last_doc(&self, b: usize) -> u32 {
+        u32_at(self.data, b * DIR_ENTRY)
+    }
+
+    /// (max weighted tf, min doc length) over block `b`.
+    pub fn block_limits(&self, b: usize) -> (u32, u32) {
+        (u32_at(self.data, b * DIR_ENTRY + 8), u32_at(self.data, b * DIR_ENTRY + 12))
+    }
+
+    /// Decodes block `b` into `docs`/`tfs`, returning how many pairs it holds.
+    pub fn decode_block(&self, b: usize, docs: &mut [u32; BLOCK], tfs: &mut [u32; BLOCK]) -> usize {
+        let n_blocks = self.n_blocks();
+        let payload = &self.data[n_blocks * DIR_ENTRY..];
+        let mut i = u32_at(self.data, b * DIR_ENTRY + 4) as usize;
+        let len = if b + 1 == n_blocks { self.df as usize - b * BLOCK } else { BLOCK };
+        let mut doc = if b == 0 { 0 } else { self.last_doc(b - 1) };
+        for k in 0..len {
+            doc += read_varint(payload, &mut i);
+            docs[k] = doc;
+            tfs[k] = read_varint(payload, &mut i);
+        }
+        len
+    }
+
     pub fn for_each(&self, mut f: impl FnMut(u32, u32)) {
-        let (mut i, mut doc) = (0, 0);
-        while i < self.data.len() {
-            doc += read_varint(self.data, &mut i);
-            let tf = read_varint(self.data, &mut i);
-            f(doc, tf);
+        let (mut docs, mut tfs) = ([0u32; BLOCK], [0u32; BLOCK]);
+        for b in 0..self.n_blocks() {
+            let n = self.decode_block(b, &mut docs, &mut tfs);
+            for k in 0..n {
+                f(docs[k], tfs[k]);
+            }
         }
     }
 }
@@ -256,6 +308,9 @@ impl Segment {
         let mut it = meta_txt.split_whitespace();
         let n_docs: u32 = it.next().and_then(|s| s.parse().ok()).ok_or_else(bad)?;
         let total_len: u64 = it.next().and_then(|s| s.parse().ok()).ok_or_else(bad)?;
+        if it.next() != Some(FORMAT) {
+            return Err(io::Error::other(format!("{} uses an older index format; rebuild the index", dir.display())));
+        }
 
         let mut deleted = vec![false; n_docs as usize];
         let mut n_deleted = 0;
