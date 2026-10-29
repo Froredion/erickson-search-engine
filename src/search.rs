@@ -45,6 +45,19 @@ pub struct Results {
     pub hits: Vec<Hit>,
     pub matched: u64,
     pub micros: u128,
+    /// Time and major page faults per phase: term lookup, first-stage scoring, re-rank + snippets.
+    pub phase_micros: [u128; 3],
+    pub phase_faults: [u64; 3],
+}
+
+/// Major page faults so far in this process: each is a read from disk. Linux only; 0 elsewhere.
+fn major_faults() -> u64 {
+    if !cfg!(target_os = "linux") {
+        return 0;
+    }
+    // Field 12 of /proc/self/stat, counted after the parenthesised command name.
+    let stat = fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(9)).and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
 /// Which ranking signals run. Web search uses everything; benchmarks switch signals off one at
@@ -248,9 +261,10 @@ impl Index {
 
     pub fn search_with(&self, q: &str, k: usize, offset: usize, opts: Opts) -> Results {
         let t0 = Instant::now();
+        let f0 = major_faults();
         let terms = query_terms(q);
         if terms.is_empty() || self.segs.is_empty() {
-            return Results { hits: Vec::new(), matched: 0, micros: t0.elapsed().as_micros() };
+            return Results { hits: Vec::new(), matched: 0, micros: t0.elapsed().as_micros(), phase_micros: [0; 3], phase_faults: [0; 3] };
         }
 
         // Each term is looked up once per shard; IDF and scoring both use the result.
@@ -270,6 +284,8 @@ impl Index {
                 }
             })
             .collect();
+
+        let (t1, f1) = (t0.elapsed().as_micros(), major_faults());
 
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(self.segs.len());
         let chunk = self.segs.len().div_ceil(threads);
@@ -299,6 +315,8 @@ impl Index {
             }
             (heap, matched)
         });
+
+        let (t2, f2) = (t0.elapsed().as_micros(), major_faults());
 
         let term_set: HashSet<&str> = terms.iter().map(String::as_str).collect();
         let mut ranked: Vec<(f32, Cand)> = heap
@@ -338,7 +356,8 @@ impl Index {
                 break;
             }
         }
-        Results { hits, matched, micros: t0.elapsed().as_micros() }
+        let (t3, f3) = (t0.elapsed().as_micros(), major_faults());
+        Results { hits, matched, micros: t3, phase_micros: [t1, t2 - t1, t3 - t2], phase_faults: [f1 - f0, f2 - f1, f3 - f2] }
     }
 
     /// First stage: field-weighted BM25 × term coverage × static page prior, over shards `from..to`.

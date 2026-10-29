@@ -4,6 +4,7 @@
 //! Files in a segment directory:
 //!   terms.bin     term bytes, concatenated in sorted order
 //!   terms.idx     28 bytes per term: term offset u64, term len u32, df u32, postings offset u64, postings len u32
+//!   terms.sample  every SAMPLE-th term, held in RAM by readers: count u32, count + 1 u32 offsets, term bytes
 //!   postings.bin  per term: a block directory, then the blocks (see below)
 //!   docmeta.bin   12 bytes per doc: body length u32, quality f32, authority f32
 //!   store.bin     per doc: url, title, text, each as u32 length + bytes
@@ -167,7 +168,12 @@ impl SegmentWriter {
         let mut post = BufWriter::new(File::create(self.dir.join("postings.bin"))?);
         let (mut term_off, mut post_off) = (0u64, 0u64);
         let (mut buf, mut payload) = (Vec::new(), Vec::new());
-        for (term, p) in &terms {
+        let (mut sample, mut sample_at) = (Vec::new(), vec![0u32]);
+        for (i, (term, p)) in terms.iter().enumerate() {
+            if i % SAMPLE == 0 {
+                sample.extend_from_slice(term.as_bytes());
+                sample_at.push(sample.len() as u32);
+            }
             buf.clear();
             payload.clear();
             let mut prev = 0;
@@ -201,6 +207,7 @@ impl SegmentWriter {
         idx.flush()?;
         post.flush()?;
 
+        fs::write(self.dir.join("terms.sample"), encode_sample(&sample_at, &sample))?;
         fs::write(self.dir.join("docmeta.bin"), &self.meta)?;
         let offsets: Vec<u8> = self.store_offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
         fs::write(self.dir.join("store.idx"), offsets)?;
@@ -217,6 +224,21 @@ impl SegmentWriter {
 pub fn write_tombstones(seg_dir: &Path, docs: &[u32]) -> io::Result<()> {
     let bytes: Vec<u8> = docs.iter().flat_map(|d| d.to_le_bytes()).collect();
     fs::write(seg_dir.join("deleted.bin"), bytes)
+}
+
+fn encode_sample(at: &[u32], bytes: &[u8]) -> Vec<u8> {
+    let mut out = ((at.len() - 1) as u32).to_le_bytes().to_vec();
+    out.extend(at.iter().flat_map(|o| o.to_le_bytes()));
+    out.extend_from_slice(bytes);
+    out
+}
+
+fn decode_sample(b: &[u8]) -> Option<(Vec<u32>, Vec<u8>)> {
+    let n = u32_at(b.get(..4)?, 0) as usize;
+    let end = 4 + 4 * (n + 1);
+    let at: Vec<u32> = b.get(4..end)?.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let bytes = b.get(end..)?.to_vec();
+    (at.last().copied() == Some(bytes.len() as u32)).then_some((at, bytes))
 }
 
 fn map(path: &Path, advice: Advice) -> io::Result<Mmap> {
@@ -300,7 +322,8 @@ pub struct Segment {
     terms: Mmap,
     idx: Mmap,
     postings: Mmap,
-    meta: Mmap,
+    /// Read for every scored doc, so held in RAM (12 bytes per doc).
+    meta: Vec<u8>,
     store: Mmap,
     store_idx: Mmap,
     /// Every SAMPLE-th term, concatenated; term i*SAMPLE spans sample[sample_at[i]..sample_at[i + 1]].
@@ -334,17 +357,29 @@ impl Segment {
         }
         // The dictionary and the stored pages are read at random, so readahead only pulls in
         // pages nobody asked for and evicts the ones that matter. Postings are read front to back.
-        let (idx, terms) = (map(&dir.join("terms.idx"), Advice::Sequential)?, map(&dir.join("terms.bin"), Advice::Sequential)?);
+        let (idx, terms) = (map(&dir.join("terms.idx"), Advice::Random)?, map(&dir.join("terms.bin"), Advice::Random)?);
         let n_terms = idx.len() / ENTRY;
-        let (mut sample, mut sample_at) = (Vec::new(), vec![0u32]);
-        for i in (0..n_terms).step_by(SAMPLE) {
-            let e = i * ENTRY;
-            let off = u64_at(&idx, e) as usize;
-            sample.extend_from_slice(&terms[off..off + u32_at(&idx, e + 8) as usize]);
-            sample_at.push(sample.len() as u32);
-        }
-        let _ = idx.advise(Advice::Random);
-        let _ = terms.advise(Advice::Random);
+        let sample_path = dir.join("terms.sample");
+        let (sample_at, sample) = match fs::read(&sample_path).ok().as_deref().and_then(decode_sample) {
+            Some(s) => s,
+            None => {
+                // Index built before terms.sample existed: sample the dictionary once, front to
+                // back, and keep the result so later opens skip this.
+                let _ = idx.advise(Advice::Sequential);
+                let _ = terms.advise(Advice::Sequential);
+                let (mut sample, mut sample_at) = (Vec::new(), vec![0u32]);
+                for i in (0..n_terms).step_by(SAMPLE) {
+                    let e = i * ENTRY;
+                    let off = u64_at(&idx, e) as usize;
+                    sample.extend_from_slice(&terms[off..off + u32_at(&idx, e + 8) as usize]);
+                    sample_at.push(sample.len() as u32);
+                }
+                let _ = idx.advise(Advice::Random);
+                let _ = terms.advise(Advice::Random);
+                let _ = fs::write(&sample_path, encode_sample(&sample_at, &sample));
+                (sample_at, sample)
+            }
+        };
         Ok(Self {
             n_docs,
             total_len,
@@ -352,7 +387,7 @@ impl Segment {
             terms,
             idx,
             postings: map(&dir.join("postings.bin"), Advice::Normal)?,
-            meta: map(&dir.join("docmeta.bin"), Advice::Random)?,
+            meta: fs::read(dir.join("docmeta.bin"))?,
             store: map(&dir.join("store.bin"), Advice::Random)?,
             store_idx: map(&dir.join("store.idx"), Advice::Random)?,
             sample,

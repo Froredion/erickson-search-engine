@@ -30,7 +30,8 @@ echo "$GEN" > /data/index/CURRENT
 echo "fetched $(du -sh "/data/index/$GEN" | cut -f1) in $(( $(date +%s) - start ))s" | tee "$OUT/fetch.txt"
 
 if [ "$status" = ok ]; then
-  "$BIN" stats --index /data/index > "$OUT/stats.txt" 2>&1 || status=failed
+  # The first open of an index built before terms.sample existed writes it; timed on its own.
+  /usr/bin/time -v "$BIN" stats --index /data/index > "$OUT/stats.txt" 2> "$OUT/open.time" || status=failed
   free -g > "$OUT/free.txt"
   # Cold: nothing of the index in the page cache, as on a node that just started.
   for set in web latency; do

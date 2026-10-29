@@ -192,6 +192,7 @@ fn eval(a: &Args) -> io::Result<()> {
     let ix = search::Index::open(&a.index()?)?;
     let file = a.pos.first().ok_or_else(|| io::Error::other("which queries file?"))?;
     let mut latencies = Vec::new();
+    let (mut phase_micros, mut phase_faults) = ([0u128; 3], [0u64; 3]);
     for line in fs::read_to_string(file)?.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -199,14 +200,28 @@ fn eval(a: &Args) -> io::Result<()> {
         let q = line.strip_prefix("nav:").unwrap_or(line).trim();
         let r = ix.search_with(q, 3, 0, search::Opts { exhaustive: a.has("exhaustive"), ..Default::default() });
         latencies.push(r.micros);
-        println!("\x1b[1m{q}\x1b[0m  ({:.1} ms, {} matches)", r.micros as f64 / 1000.0, r.matched);
+        let [lookup, first, rest] = r.phase_micros.map(|us| us as f64 / 1000.0);
+        let [fl, ff, fr] = r.phase_faults;
+        println!(
+            "\x1b[1m{q}\x1b[0m  ({:.1} ms, {} matches; lookup {lookup:.1} / score {first:.1} / rerank {rest:.1} ms; faults {fl} / {ff} / {fr})",
+            r.micros as f64 / 1000.0,
+            r.matched
+        );
+        for i in 0..3 {
+            phase_micros[i] += r.phase_micros[i];
+            phase_faults[i] += r.phase_faults[i];
+        }
         for h in &r.hits {
             println!("    {:<60}  \x1b[32m{}\x1b[0m", segment::truncate(&h.title, 60), h.url);
         }
     }
     latencies.sort_unstable();
     let pct = |p: usize| latencies.get((latencies.len() * p / 100).min(latencies.len().saturating_sub(1))).copied().unwrap_or(0) as f64 / 1000.0;
-    println!("\n{} queries: p50 {:.1} ms, p99 {:.1} ms", latencies.len(), pct(50), pct(99));
+    let n = latencies.len().max(1);
+    let [lookup, first, rest] = phase_micros.map(|us| us as f64 / 1000.0 / n as f64);
+    let [fl, ff, fr] = phase_faults.map(|f| f / n as u64);
+    println!("\nmean per query: lookup {lookup:.1} / score {first:.1} / rerank {rest:.1} ms; faults {fl} / {ff} / {fr}");
+    println!("{} queries: p50 {:.1} ms, p99 {:.1} ms", latencies.len(), pct(50), pct(99));
     Ok(())
 }
 
