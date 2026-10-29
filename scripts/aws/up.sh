@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Launch the indexing machine on AWS, copy this repo to it and build it there.
 #
-#   scripts/aws/up.sh             # i3en.12xlarge on-demand in us-east-1 (where Common Crawl lives)
-#   TYPE=i3en.6xlarge scripts/aws/up.sh
+#   scripts/aws/up.sh             # i3en.xlarge on-demand in us-east-1
+#   TYPE=i3en.12xlarge scripts/aws/up.sh   # needs a 48-vCPU quota
 #
 # Creates, all named "erickson": an SSH key pair (saved to .aws/key.pem), a security group open
 # to SSH from this machine's IP only, an IAM role that can read the Common Crawl bucket, and one
@@ -11,8 +11,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+export AWS_PROFILE=${AWS_PROFILE:-erickson}   # from `aws login --profile erickson`
 export AWS_DEFAULT_REGION=${REGION:-us-east-1}
-TYPE=${TYPE:-i3en.12xlarge}
+TYPE=${TYPE:-i3en.xlarge}
 MAX_HOURS=${MAX_HOURS:-16}
 NAME=erickson
 STATE=.aws
@@ -48,8 +49,10 @@ if ! aws iam get-instance-profile --instance-profile-name "$NAME" >/dev/null 2>&
   sleep 15
 fi
 
-AMI=$(aws ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
-  --query Parameter.Value --output text)
+# Newest Ubuntu 24.04 image from Canonical (owner 099720109477), looked up through EC2 alone.
+AMI=$(aws ec2 describe-images --owners 099720109477 \
+  --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' 'Name=state,Values=available' \
+  --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text)
 ID=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" --key-name "$NAME" \
   --security-group-ids "$SG" --iam-instance-profile "Name=$NAME" \
   --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=40,VolumeType=gp3,DeleteOnTermination=true}' \
@@ -64,8 +67,9 @@ echo "$IP" > "$STATE/ip"
 
 SSH=(ssh -i "$STATE/key.pem" -o StrictHostKeyChecking=accept-new "ubuntu@$IP")
 "${SSH[@]}" "sudo shutdown -h +$((MAX_HOURS * 60)) 'erickson cost cap reached'" 2>/dev/null || true
-rsync -az --delete --exclude target --exclude data --exclude 'index*' --exclude .aws --exclude .git \
-  -e "ssh -i $STATE/key.pem" ./ "ubuntu@$IP:erickson/"
+# Only the sources the build needs. (macOS's openrsync silently dropped static/ here.)
+tar -cz Cargo.toml Cargo.lock src static scripts eval | "${SSH[@]}" "rm -rf erickson && mkdir erickson && tar -xz -C erickson"
+"${SSH[@]}" "test -s erickson/static/index.html" || { echo "copy to the instance is incomplete" >&2; exit 1; }
 "${SSH[@]}" "bash erickson/scripts/aws/setup.sh"
 
 echo

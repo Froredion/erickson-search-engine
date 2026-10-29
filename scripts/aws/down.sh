@@ -4,6 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+export AWS_PROFILE=${AWS_PROFILE:-erickson}   # from `aws login --profile erickson`
 export AWS_DEFAULT_REGION=${REGION:-us-east-1}
 NAME=erickson
 STATE=.aws
@@ -21,6 +22,7 @@ aws ec2 delete-key-pair --key-name "$NAME" >/dev/null 2>&1 || true
 aws iam remove-role-from-instance-profile --instance-profile-name "$NAME" --role-name "$NAME" 2>/dev/null || true
 aws iam delete-instance-profile --instance-profile-name "$NAME" 2>/dev/null || true
 aws iam delete-role-policy --role-name "$NAME" --policy-name commoncrawl-read 2>/dev/null || true
+aws iam delete-role-policy --role-name "$NAME" --policy-name index-bucket-write 2>/dev/null || true
 aws iam delete-role --role-name "$NAME" 2>/dev/null || true
 rm -rf "$STATE"
 
