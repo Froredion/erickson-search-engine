@@ -253,13 +253,16 @@ impl Index {
             return Results { hits: Vec::new(), matched: 0, micros: t0.elapsed().as_micros() };
         }
 
+        // Each term is looked up once per shard; IDF and scoring both use the result.
+        let lists: Vec<Vec<Option<Postings>>> =
+            self.segs.iter().map(|s| terms.iter().map(|t| s.lookup(t)).collect()).collect();
+
         // IDF from document frequencies summed over every shard, so a page scores the same
         // whichever shard it landed in.
         let n = self.n_docs as f32;
-        let idf: Vec<f32> = terms
-            .iter()
+        let idf: Vec<f32> = (0..terms.len())
             .map(|t| {
-                let df: u64 = self.segs.iter().filter_map(|s| s.lookup(t)).map(|p| p.df as u64).sum();
+                let df: u64 = lists.iter().filter_map(|l| l[t]).map(|p| p.df as u64).sum();
                 if df == 0 {
                     0.0
                 } else {
@@ -274,13 +277,13 @@ impl Index {
             let handles: Vec<_> = (0..self.segs.len())
                 .step_by(chunk)
                 .map(|from| {
-                    let (terms, idf) = (&terms, &idf);
+                    let (lists, idf) = (&lists, &idf);
                     let to = (from + chunk).min(self.segs.len());
                     s.spawn(move || {
                         if opts.exhaustive {
-                            self.score_shards(from, to, terms, idf, opts.coverage)
+                            self.score_shards(from, to, lists, idf, opts.coverage)
                         } else {
-                            self.wand_shards(from, to, terms, idf, opts.coverage)
+                            self.wand_shards(from, to, lists, idf, opts.coverage)
                         }
                     })
                 })
@@ -340,7 +343,7 @@ impl Index {
 
     /// First stage: field-weighted BM25 × term coverage × static page prior, over shards `from..to`.
     /// Coverage is weighted by IDF, so missing "faucet" costs far more than missing "how".
-    fn score_shards(&self, from: usize, to: usize, terms: &[String], idf: &[f32], use_coverage: bool) -> (Vec<Cand>, u64) {
+    fn score_shards(&self, from: usize, to: usize, lists: &[Vec<Option<Postings>>], idf: &[f32], use_coverage: bool) -> (Vec<Cand>, u64) {
         let mut heap = BinaryHeap::with_capacity(CANDIDATES + 1);
         let mut matched = 0u64;
         let (mut acc, mut covered, mut touched) = (Vec::<f32>::new(), Vec::<f32>::new(), Vec::<u32>::new());
@@ -354,11 +357,11 @@ impl Index {
             covered.clear();
             covered.resize(nd, 0.0);
             touched.clear();
-            for (t, &w) in terms.iter().zip(idf) {
+            for (&p, &w) in lists[si].iter().zip(idf) {
                 if w == 0.0 {
                     continue;
                 }
-                let Some(p) = seg.lookup(t) else { continue };
+                let Some(p) = p else { continue };
                 p.for_each(|d, tf| {
                     let di = d as usize;
                     let tf = tf as f32;
@@ -393,7 +396,7 @@ impl Index {
     ///
     /// `matched` is a lower bound here (the largest single-term df per shard), since skipped docs
     /// are never counted.
-    fn wand_shards(&self, from: usize, to: usize, terms: &[String], idf: &[f32], use_coverage: bool) -> (Vec<Cand>, u64) {
+    fn wand_shards(&self, from: usize, to: usize, lists: &[Vec<Option<Postings>>], idf: &[f32], use_coverage: bool) -> (Vec<Cand>, u64) {
         let mut heap = BinaryHeap::with_capacity(CANDIDATES + 1);
         let mut matched = 0u64;
         let total_idf: f32 = idf.iter().sum::<f32>().max(f32::MIN_POSITIVE);
@@ -405,12 +408,12 @@ impl Index {
 
         for si in from..to {
             let seg = &self.segs[si];
-            let mut cs: Vec<Cursor> = terms
+            let mut cs: Vec<Cursor> = lists[si]
                 .iter()
                 .zip(idf)
                 .filter(|(_, &w)| w > 0.0)
                 .enumerate()
-                .filter_map(|(term, (t, &w))| seg.lookup(t).map(|p| Cursor::new(p, term, w, &bound)))
+                .filter_map(|(term, (&p, &w))| p.map(|p| Cursor::new(p, term, w, &bound)))
                 .collect();
             matched += cs.iter().map(|c| c.p.df as u64).max().unwrap_or(0);
 

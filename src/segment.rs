@@ -21,7 +21,7 @@
 //! Segments live in a generation directory (`gen-0001/`). A generation only becomes visible to
 //! queries once it's complete and `CURRENT` points at it.
 
-use memmap2::Mmap;
+use memmap2::{Advice, Mmap};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -35,6 +35,9 @@ pub const BLOCK: usize = 128;
 const DIR_ENTRY: usize = 16;
 const FORMAT: &str = "2";
 const STORED_TEXT_BYTES: usize = 4096;
+/// Every SAMPLE-th term of the dictionary is kept in memory, so a lookup binary-searches RAM and
+/// then reads one small run of `terms.idx` instead of ~20 scattered entries.
+const SAMPLE: usize = 64;
 /// Term frequency weights per field: a word in the title or URL counts as several in the body.
 const TITLE_WEIGHT: u32 = 3;
 const URL_WEIGHT: u32 = 2;
@@ -216,10 +219,13 @@ pub fn write_tombstones(seg_dir: &Path, docs: &[u32]) -> io::Result<()> {
     fs::write(seg_dir.join("deleted.bin"), bytes)
 }
 
-fn map(path: &Path) -> io::Result<Mmap> {
+fn map(path: &Path, advice: Advice) -> io::Result<Mmap> {
     let f = File::open(path)?;
     // Safety: segment files are written once and never modified while mapped.
-    unsafe { Mmap::map(&f) }
+    let m = unsafe { Mmap::map(&f) }?;
+    // Only a hint, so failing to give it is harmless.
+    let _ = m.advise(advice);
+    Ok(m)
 }
 
 fn u32_at(b: &[u8], o: usize) -> u32 {
@@ -297,6 +303,9 @@ pub struct Segment {
     meta: Mmap,
     store: Mmap,
     store_idx: Mmap,
+    /// Every SAMPLE-th term, concatenated; term i*SAMPLE spans sample[sample_at[i]..sample_at[i + 1]].
+    sample: Vec<u8>,
+    sample_at: Vec<u32>,
     deleted: Vec<bool>,
     n_deleted: u32,
 }
@@ -323,17 +332,31 @@ impl Segment {
                 }
             }
         }
-        let idx = map(&dir.join("terms.idx"))?;
+        // The dictionary and the stored pages are read at random, so readahead only pulls in
+        // pages nobody asked for and evicts the ones that matter. Postings are read front to back.
+        let (idx, terms) = (map(&dir.join("terms.idx"), Advice::Sequential)?, map(&dir.join("terms.bin"), Advice::Sequential)?);
+        let n_terms = idx.len() / ENTRY;
+        let (mut sample, mut sample_at) = (Vec::new(), vec![0u32]);
+        for i in (0..n_terms).step_by(SAMPLE) {
+            let e = i * ENTRY;
+            let off = u64_at(&idx, e) as usize;
+            sample.extend_from_slice(&terms[off..off + u32_at(&idx, e + 8) as usize]);
+            sample_at.push(sample.len() as u32);
+        }
+        let _ = idx.advise(Advice::Random);
+        let _ = terms.advise(Advice::Random);
         Ok(Self {
             n_docs,
             total_len,
-            n_terms: idx.len() / ENTRY,
-            terms: map(&dir.join("terms.bin"))?,
+            n_terms,
+            terms,
             idx,
-            postings: map(&dir.join("postings.bin"))?,
-            meta: map(&dir.join("docmeta.bin"))?,
-            store: map(&dir.join("store.bin"))?,
-            store_idx: map(&dir.join("store.idx"))?,
+            postings: map(&dir.join("postings.bin"), Advice::Normal)?,
+            meta: map(&dir.join("docmeta.bin"), Advice::Random)?,
+            store: map(&dir.join("store.bin"), Advice::Random)?,
+            store_idx: map(&dir.join("store.idx"), Advice::Random)?,
+            sample,
+            sample_at,
             deleted,
             n_deleted,
         })
@@ -346,7 +369,22 @@ impl Segment {
     }
 
     pub fn lookup(&self, term: &str) -> Option<Postings<'_>> {
-        let (mut lo, mut hi) = (0, self.n_terms);
+        // Last sampled term <= `term`; the term, if present, is in the SAMPLE entries from there.
+        let sampled = |i: usize| &self.sample[self.sample_at[i] as usize..self.sample_at[i + 1] as usize];
+        let n_samples = self.sample_at.len() - 1;
+        let (mut lo, mut hi) = (0, n_samples);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if sampled(mid) <= term.as_bytes() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return None;
+        }
+        let (mut lo, mut hi) = ((lo - 1) * SAMPLE, (lo * SAMPLE).min(self.n_terms));
         while lo < hi {
             let mid = (lo + hi) / 2;
             match self.term(mid).cmp(term.as_bytes()) {
