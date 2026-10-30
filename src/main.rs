@@ -23,12 +23,12 @@ const USAGE: &str = "usage:
   erickson serve   --index DIR [--port 8080]
   erickson query   --index DIR QUERY...
   erickson eval    --index DIR QUERIES_FILE [--exhaustive]
-  erickson merge   --index DIR [--segments 16] [--threads N] [--no-publish] [--keep 2]
+  erickson merge   --index DIR [--segments 16] [--keep-order] [--threads N] [--no-publish] [--keep 2]
   erickson publish --index DIR GENERATION
   erickson stats   --index DIR";
 
 /// Flags that take no value.
-const SWITCHES: [&str; 4] = ["no-publish", "resume", "no-dedup", "exhaustive"];
+const SWITCHES: [&str; 5] = ["no-publish", "resume", "no-dedup", "exhaustive", "keep-order"];
 
 pub struct Args {
     flags: HashMap<String, String>,

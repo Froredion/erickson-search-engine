@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::ranks::{self, Ranks};
 use crate::segment::{self, SegmentWriter};
-use crate::{dedup, filter, wet, Args, USAGE};
+use crate::{dedup, filter, search, wet, Args, USAGE};
 
 enum Input {
     Local(PathBuf),
@@ -267,8 +267,9 @@ fn write_passages(dir: &Path, seg: u32, lines: &[String]) -> io::Result<u64> {
 }
 
 /// `merge`: rewrites the published generation as `--segments` (default 16) larger segments, each
-/// a run of consecutive old ones, into a new generation. Every query returns the same results;
-/// it just has fewer dictionaries to look up.
+/// a run of consecutive old ones, into a new generation. Docs are renumbered by page prior so
+/// queries can stop early (see `segment::merge`); scores are unchanged, so results are too, up
+/// to the order of exact ties. `--keep-order` keeps doc order, and with it tie order.
 pub fn merge(a: &Args) -> io::Result<()> {
     let root = a.index()?;
     let from = segment::current(&root)?;
@@ -293,6 +294,7 @@ pub fn merge(a: &Args) -> io::Result<()> {
         groups.last_mut().unwrap().push(p);
     }
 
+    let prior = (!a.has("keep-order")).then_some(search::prior as fn(f32, f32) -> f32);
     let (generation, tmp) = begin_generation(&root, false)?;
     let threads = threads(a, 1).min(groups.len());
     eprintln!("{generation}: merging {total} docs into {} segments, {threads} workers", groups.len());
@@ -304,7 +306,7 @@ pub fn merge(a: &Args) -> io::Result<()> {
             s.spawn(|| loop {
                 let g = next.fetch_add(1, Relaxed);
                 let Some(group) = groups.get(g) else { break };
-                match segment::merge(&tmp.join(segment::seg_name(g as u32)), group) {
+                match segment::merge(&tmp.join(segment::seg_name(g as u32)), group, prior) {
                     Ok(n) => eprintln!("{} done ({} segments, {n} docs, {:.0}s)", segment::seg_name(g as u32), group.len(), t0.elapsed().as_secs_f32()),
                     Err(e) => {
                         eprintln!("{} failed: {e}", segment::seg_name(g as u32));

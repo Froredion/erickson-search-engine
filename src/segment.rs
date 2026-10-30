@@ -29,6 +29,7 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use crate::dedup;
 use crate::tokenize::tokens;
 
 const ENTRY: usize = 28;
@@ -262,12 +263,15 @@ impl DictWriter {
     }
 }
 
-/// Writes one segment at `dir` holding every doc of `sources`, in order: doc d of the i-th source
-/// becomes doc d + (docs in the sources before it). Tombstoned docs are kept and stay tombstoned,
-/// so document frequencies, lengths and tie-breaks, and with them every result, are unchanged.
-/// Reads each source front to back; memory is one term's postings plus the docmeta. Returns the
-/// number of docs written.
-pub fn merge(dir: &Path, sources: &[PathBuf]) -> io::Result<u32> {
+/// Writes one segment at `dir` holding every doc of `sources`. Tombstoned docs are kept and stay
+/// tombstoned, so document frequencies and lengths, and with them every score, are unchanged.
+///
+/// With `prior`, docs are renumbered by it, highest first (ties in source order), so a query can
+/// bound the prior of every doc after the one it's on by that doc's own prior. Without it, doc d
+/// of the i-th source becomes d + (docs in the sources before it), which also keeps tie-breaks.
+/// Reads the dictionaries and postings front to back; memory is one term's postings plus a few
+/// bytes per doc. Returns the number of docs written.
+pub fn merge(dir: &Path, sources: &[PathBuf], prior: Option<fn(f32, f32) -> f32>) -> io::Result<u32> {
     fs::create_dir_all(dir)?;
     let segs = sources.iter().map(|p| Segment::open(p)).collect::<io::Result<Vec<_>>>()?;
     let mut base = Vec::with_capacity(segs.len());
@@ -281,43 +285,70 @@ pub fn merge(dir: &Path, sources: &[PathBuf]) -> io::Result<u32> {
         }
     }
 
-    let meta: Vec<u8> = segs.iter().flat_map(|s| s.meta.iter().copied()).collect();
-    let deleted: Vec<u32> = segs
-        .iter()
-        .zip(&base)
-        .flat_map(|(s, &b)| s.deleted.iter().enumerate().filter(|(_, &x)| x).map(move |(d, _)| b + d as u32))
-        .collect();
+    // (source, doc) of every doc in its new order, and the new id of every old one.
+    let mut order: Vec<(u32, u32)> = segs.iter().enumerate().flat_map(|(i, s)| (0..s.n_docs).map(move |d| (i as u32, d))).collect();
+    if let Some(prior) = prior {
+        let key = |&(i, d): &(u32, u32)| {
+            let s = &segs[i as usize];
+            prior(s.authority(d), s.quality(d))
+        };
+        order.sort_by(|x, y| key(y).total_cmp(&key(x)));
+    }
+    let mut new_id = vec![0u32; n_docs as usize];
+    for (n, &(i, d)) in order.iter().enumerate() {
+        new_id[(base[i as usize] + d) as usize] = n as u32;
+    }
+
+    let meta: Vec<u8> = order.iter().flat_map(|&(i, d)| {
+        let o = d as usize * META;
+        segs[i as usize].meta[o..o + META].iter().copied()
+    }).collect();
+    let mut deleted: Vec<u32> =
+        order.iter().enumerate().filter(|(_, &(i, d))| segs[i as usize].deleted[d as usize]).map(|(n, _)| n as u32).collect();
+    deleted.sort_unstable();
     if !deleted.is_empty() {
         write_tombstones(dir, &deleted)?;
     }
 
+    // Stored pages and dedup records, in the new order. Reads the sources' stores front to back
+    // unless renumbering shuffled them.
     let mut store = BufWriter::with_capacity(1 << 20, File::create(dir.join("store.bin"))?);
     let mut store_idx = BufWriter::with_capacity(1 << 20, File::create(dir.join("store.idx"))?);
-    let mut fingerprints = BufWriter::with_capacity(1 << 20, File::create(dir.join("fingerprints.bin"))?);
     let mut store_pos = 0u64;
-    for (s, src) in segs.iter().zip(sources) {
-        let _ = s.store.advise(Advice::Sequential);
-        store.write_all(&s.store)?;
-        for o in s.store_idx.chunks_exact(8) {
-            store_idx.write_all(&(u64::from_le_bytes(o.try_into().unwrap()) + store_pos).to_le_bytes())?;
-        }
-        store_pos += s.store.len() as u64;
-        if let Ok(mut f) = File::open(src.join("fingerprints.bin")) {
-            io::copy(&mut f, &mut fingerprints)?;
-        }
+    let advice = if prior.is_some() { Advice::Random } else { Advice::Sequential };
+    for s in &segs {
+        let _ = s.store.advise(advice);
+    }
+    for &(i, d) in &order {
+        let s = &segs[i as usize];
+        let from = u64_at(&s.store_idx, d as usize * 8) as usize;
+        let to = if d + 1 < s.n_docs { u64_at(&s.store_idx, (d as usize + 1) * 8) as usize } else { s.store.len() };
+        store.write_all(&s.store[from..to])?;
+        store_idx.write_all(&store_pos.to_le_bytes())?;
+        store_pos += (to - from) as u64;
     }
     store.flush()?;
     store_idx.flush()?;
-    fingerprints.flush()?;
+    let fps: Vec<Vec<u8>> = sources.iter().map(|p| fs::read(p.join("fingerprints.bin")).unwrap_or_default()).collect();
+    if fps.iter().zip(&segs).all(|(f, s)| f.len() == s.n_docs as usize * dedup::RECORD) {
+        let mut out = BufWriter::with_capacity(1 << 20, File::create(dir.join("fingerprints.bin"))?);
+        for &(i, d) in &order {
+            let o = d as usize * dedup::RECORD;
+            out.write_all(&fps[i as usize][o..o + dedup::RECORD])?;
+        }
+        out.flush()?;
+    }
+    drop(fps);
 
-    // k-way merge of the sorted dictionaries. Ties pop in source order, so docs stay ascending.
+    // k-way merge of the sorted dictionaries. Ties pop in source order, so without renumbering
+    // docs come out ascending already.
     let mut heap: BinaryHeap<Reverse<(&[u8], usize, usize)>> =
         segs.iter().enumerate().filter(|(_, s)| s.n_terms > 0).map(|(i, s)| Reverse((s.term(0), i, 0))).collect();
     let mut dict = DictWriter::create(dir)?;
-    let mut pairs = Vec::new();
+    let (mut packed, mut pairs) = (Vec::<u64>::new(), Vec::new());
     let (mut docs, mut tfs) = ([0u32; BLOCK], [0u32; BLOCK]);
     while let Some(Reverse((term, _, _))) = heap.peek().copied() {
-        pairs.clear();
+        packed.clear();
         while let Some(&Reverse((t, i, ti))) = heap.peek() {
             if t != term {
                 break;
@@ -327,13 +358,18 @@ pub fn merge(dir: &Path, sources: &[PathBuf]) -> io::Result<u32> {
             for b in 0..p.n_blocks() {
                 let n = p.decode_block(b, &mut docs, &mut tfs);
                 for k in 0..n {
-                    pairs.extend_from_slice(&[base[i] + docs[k], tfs[k]]);
+                    packed.push((new_id[(base[i] + docs[k]) as usize] as u64) << 32 | tfs[k] as u64);
                 }
             }
             if ti + 1 < segs[i].n_terms {
                 heap.push(Reverse((segs[i].term(ti + 1), i, ti + 1)));
             }
         }
+        if prior.is_some() {
+            packed.sort_unstable();
+        }
+        pairs.clear();
+        pairs.extend(packed.iter().flat_map(|&x| [(x >> 32) as u32, x as u32]));
         dict.add(term, &pairs, &meta)?;
     }
     dict.finish()?;

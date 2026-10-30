@@ -29,6 +29,9 @@ const SNIPPET_BYTES: usize = 240;
 pub struct Index {
     pub generation: String,
     segs: Vec<Segment>,
+    /// Per segment: docs are numbered by prior, highest first (see `segment::merge`), so the
+    /// prior of the doc a query is on bounds every doc after it.
+    by_prior: Vec<bool>,
     pub n_docs: u64,
     pub n_deleted: u64,
     avgdl: f32,
@@ -86,7 +89,12 @@ impl Default for Opts {
 const PRIOR_MAX: f32 = 1.4;
 
 fn page_prior(seg: &Segment, d: u32) -> f32 {
-    (0.6 + 0.8 * seg.authority(d)) * (0.5 + 0.5 * seg.quality(d))
+    prior(seg.authority(d), seg.quality(d))
+}
+
+/// Static page prior from link authority and content quality, both in 0..=1.
+pub fn prior(authority: f32, quality: f32) -> f32 {
+    (0.6 + 0.8 * authority) * (0.5 + 0.5 * quality)
 }
 
 /// One query term's position in one segment's postings, for block-max WAND.
@@ -247,6 +255,7 @@ impl Index {
             n_deleted: segs.iter().map(|s| s.n_deleted() as u64).sum(),
             avgdl: (total as f32 / n_docs.max(1) as f32).max(1.0),
             n_docs,
+            by_prior: segs.iter().map(|s| (1..s.n_docs).all(|d| page_prior(s, d) <= page_prior(s, d - 1))).collect(),
             segs,
         })
     }
@@ -427,6 +436,7 @@ impl Index {
 
         for si in from..to {
             let seg = &self.segs[si];
+            let prior_from = |d: u32| if self.by_prior[si] { page_prior(seg, d) } else { PRIOR_MAX };
             let mut cs: Vec<Cursor> = lists[si]
                 .iter()
                 .zip(idf)
@@ -447,11 +457,13 @@ impl Index {
                 let threshold = if heap.len() < CANDIDATES { 0.0 } else { heap.peek().map_or(0.0, |c: &Cand| c.score) };
 
                 // Pivot: the first position where the terms so far could reach the threshold.
+                // No doc before cs[0].doc is left, so its prior bounds every doc still to come.
+                let prior_max = prior_from(cs[0].doc);
                 let (mut max_sum, mut idf_sum, mut pivot) = (0.0, 0.0, None);
                 for (i, c) in cs.iter().enumerate() {
                     max_sum += c.max_score;
                     idf_sum += c.w;
-                    if PRIOR_MAX * coverage(idf_sum) * max_sum >= threshold {
+                    if prior_max * coverage(idf_sum) * max_sum >= threshold {
                         pivot = Some(i);
                         break;
                     }
@@ -470,7 +482,7 @@ impl Index {
                     idf_sum += c.w;
                     skip_to = skip_to.min(block_last.saturating_add(1));
                 }
-                if PRIOR_MAX * coverage(idf_sum) * block_sum < threshold {
+                if prior_from(d) * coverage(idf_sum) * block_sum < threshold {
                     // Nothing before the end of the shortest of these blocks can make it, and
                     // terms after the pivot haven't reached `d` yet.
                     if let Some(c) = cs.get(last + 1) {
