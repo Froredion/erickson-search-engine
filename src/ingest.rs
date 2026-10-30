@@ -266,6 +266,61 @@ fn write_passages(dir: &Path, seg: u32, lines: &[String]) -> io::Result<u64> {
     Ok(n)
 }
 
+/// `merge`: rewrites the published generation as `--segments` (default 16) larger segments, each
+/// a run of consecutive old ones, into a new generation. Every query returns the same results;
+/// it just has fewer dictionaries to look up.
+pub fn merge(a: &Args) -> io::Result<()> {
+    let root = a.index()?;
+    let from = segment::current(&root)?;
+    let mut sources: Vec<(PathBuf, u64)> = Vec::new();
+    for e in fs::read_dir(&from)? {
+        let p = e?.path();
+        if let Ok(meta) = fs::read_to_string(p.join("meta.txt")) {
+            sources.push((p, meta.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0)));
+        }
+    }
+    sources.sort();
+    let want: u64 = a.get("segments").and_then(|n| n.parse().ok()).unwrap_or(16).max(1);
+    let total: u64 = sources.iter().map(|s| s.1).sum();
+    // Cut wherever the running doc count passes the next multiple of total / want.
+    let mut groups: Vec<Vec<PathBuf>> = vec![Vec::new()];
+    let mut seen = 0;
+    for (p, docs) in sources {
+        if seen * want >= total * groups.len() as u64 && !groups.last().unwrap().is_empty() {
+            groups.push(Vec::new());
+        }
+        seen += docs;
+        groups.last_mut().unwrap().push(p);
+    }
+
+    let (generation, tmp) = begin_generation(&root, false)?;
+    let threads = threads(a, 1).min(groups.len());
+    eprintln!("{generation}: merging {total} docs into {} segments, {threads} workers", groups.len());
+    let t0 = Instant::now();
+    let next = AtomicUsize::new(0);
+    let failed = Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let g = next.fetch_add(1, Relaxed);
+                let Some(group) = groups.get(g) else { break };
+                match segment::merge(&tmp.join(segment::seg_name(g as u32)), group) {
+                    Ok(n) => eprintln!("{} done ({} segments, {n} docs, {:.0}s)", segment::seg_name(g as u32), group.len(), t0.elapsed().as_secs_f32()),
+                    Err(e) => {
+                        eprintln!("{} failed: {e}", segment::seg_name(g as u32));
+                        failed.lock().unwrap().get_or_insert(e);
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = failed.into_inner().unwrap() {
+        return Err(e);
+    }
+    eprintln!("merged in {:.0}s", t0.elapsed().as_secs_f32());
+    end_generation(a, &root, &generation, &tmp)
+}
+
 /// The staging directory for a new generation, or with `resume` the newest unfinished one.
 fn begin_generation(root: &Path, resume: bool) -> io::Result<(String, PathBuf)> {
     fs::create_dir_all(root)?;

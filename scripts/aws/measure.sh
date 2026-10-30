@@ -2,7 +2,7 @@
 # Runs on the instance, unattended: fetch a saved index from S3, measure query latency cold and
 # warm, save the results next to the index, then shut down (the instance terminates on shutdown).
 #
-#   RUN=20261028-2352-18000 BUCKET=erickson-index-<account> LATENCY_QUERIES=/data/latency.txt \
+#   RUN=20261028-2352-18000 BUCKET=erickson-index-<account> LATENCY_QUERIES=/data/latency.txt [MERGE=16 [SAVE_MERGED=1]] \
 #     nohup scripts/aws/measure.sh > /data/measure.out 2>&1 &
 #
 # Results land in s3://$BUCKET/$RUN/$NAME/ (default measure/): one eval log per pass (per-query ms
@@ -28,6 +28,18 @@ GEN=$(aws s3 cp "$SRC/index/CURRENT" -) || status=failed
 aws s3 sync "$SRC/index/$GEN" "/data/index/$GEN" --only-show-errors || status=failed
 echo "$GEN" > /data/index/CURRENT
 echo "fetched $(du -sh "/data/index/$GEN" | cut -f1) in $(( $(date +%s) - start ))s" | tee "$OUT/fetch.txt"
+
+if [ "$status" = ok ] && [ -n "${MERGE:-}" ]; then
+  # Rewrite the index as $MERGE larger segments first; SAVE_MERGED=1 also keeps the result in S3.
+  echo "== merge into $MERGE segments ($(date -u))"
+  /usr/bin/time -v "$BIN" merge --index /data/index --segments "$MERGE" --keep 1 2> "$OUT/merge.time" || status=failed
+  GEN=$(cat /data/index/CURRENT)
+  echo "merged into $GEN: $(du -sh "/data/index/$GEN" | cut -f1)" | tee "$OUT/merge.txt"
+  if [ "$status" = ok ] && [ "${SAVE_MERGED:-}" = 1 ]; then
+    aws s3 sync "/data/index/$GEN" "$SRC/index/$GEN" --only-show-errors &&
+      echo "$GEN" | aws s3 cp - "$SRC/index/CURRENT" --only-show-errors || status=failed
+  fi
+fi
 
 if [ "$status" = ok ]; then
   # The first open of an index built before terms.sample existed writes it; timed on its own.

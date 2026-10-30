@@ -23,7 +23,8 @@
 //! queries once it's complete and `CURRENT` points at it.
 
 use memmap2::{Advice, Mmap};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -163,51 +164,11 @@ impl SegmentWriter {
         let mut terms: Vec<(Box<str>, Vec<u32>)> = self.postings.drain().collect();
         terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        let mut blob = BufWriter::new(File::create(self.dir.join("terms.bin"))?);
-        let mut idx = BufWriter::new(File::create(self.dir.join("terms.idx"))?);
-        let mut post = BufWriter::new(File::create(self.dir.join("postings.bin"))?);
-        let (mut term_off, mut post_off) = (0u64, 0u64);
-        let (mut buf, mut payload) = (Vec::new(), Vec::new());
-        let (mut sample, mut sample_at) = (Vec::new(), vec![0u32]);
-        for (i, (term, p)) in terms.iter().enumerate() {
-            if i % SAMPLE == 0 {
-                sample.extend_from_slice(term.as_bytes());
-                sample_at.push(sample.len() as u32);
-            }
-            buf.clear();
-            payload.clear();
-            let mut prev = 0;
-            for block in p.chunks(2 * BLOCK) {
-                let offset = payload.len() as u32;
-                let (mut max_tf, mut min_dl) = (0u32, u32::MAX);
-                for pair in block.chunks_exact(2) {
-                    let (doc, tf) = (pair[0], pair[1]);
-                    varint(&mut payload, doc - prev);
-                    varint(&mut payload, tf);
-                    prev = doc;
-                    max_tf = max_tf.max(tf);
-                    min_dl = min_dl.min(u32_at(&self.meta, doc as usize * META));
-                }
-                for v in [prev, offset, max_tf, min_dl] {
-                    buf.extend_from_slice(&v.to_le_bytes());
-                }
-            }
-            buf.extend_from_slice(&payload);
-            blob.write_all(term.as_bytes())?;
-            post.write_all(&buf)?;
-            idx.write_all(&term_off.to_le_bytes())?;
-            idx.write_all(&(term.len() as u32).to_le_bytes())?;
-            idx.write_all(&((p.len() / 2) as u32).to_le_bytes())?;
-            idx.write_all(&post_off.to_le_bytes())?;
-            idx.write_all(&(buf.len() as u32).to_le_bytes())?;
-            term_off += term.len() as u64;
-            post_off += buf.len() as u64;
+        let mut dict = DictWriter::create(&self.dir)?;
+        for (term, p) in &terms {
+            dict.add(term.as_bytes(), p, &self.meta)?;
         }
-        blob.flush()?;
-        idx.flush()?;
-        post.flush()?;
-
-        fs::write(self.dir.join("terms.sample"), encode_sample(&sample_at, &sample))?;
+        dict.finish()?;
         fs::write(self.dir.join("docmeta.bin"), &self.meta)?;
         let offsets: Vec<u8> = self.store_offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
         fs::write(self.dir.join("store.idx"), offsets)?;
@@ -219,6 +180,167 @@ impl SegmentWriter {
         drop(self);
         fs::remove_dir_all(dir)
     }
+}
+
+/// Writes a segment's dictionary and postings, one term at a time in sorted order.
+struct DictWriter {
+    dir: PathBuf,
+    blob: BufWriter<File>,
+    idx: BufWriter<File>,
+    post: BufWriter<File>,
+    term_off: u64,
+    post_off: u64,
+    buf: Vec<u8>,
+    payload: Vec<u8>,
+    sample: Vec<u8>,
+    sample_at: Vec<u32>,
+    n_terms: usize,
+}
+
+impl DictWriter {
+    fn create(dir: &Path) -> io::Result<Self> {
+        let open = |name: &str| File::create(dir.join(name)).map(|f| BufWriter::with_capacity(1 << 20, f));
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            blob: open("terms.bin")?,
+            idx: open("terms.idx")?,
+            post: open("postings.bin")?,
+            term_off: 0,
+            post_off: 0,
+            buf: Vec::new(),
+            payload: Vec::new(),
+            sample: Vec::new(),
+            sample_at: vec![0],
+            n_terms: 0,
+        })
+    }
+
+    /// `pairs` is (doc, weighted tf) flattened, docs ascending; `meta` is the segment's docmeta.
+    fn add(&mut self, term: &[u8], pairs: &[u32], meta: &[u8]) -> io::Result<()> {
+        if self.n_terms % SAMPLE == 0 {
+            self.sample.extend_from_slice(term);
+            self.sample_at.push(self.sample.len() as u32);
+        }
+        self.n_terms += 1;
+        let (buf, payload) = (&mut self.buf, &mut self.payload);
+        buf.clear();
+        payload.clear();
+        let mut prev = 0;
+        for block in pairs.chunks(2 * BLOCK) {
+            let offset = payload.len() as u32;
+            let (mut max_tf, mut min_dl) = (0u32, u32::MAX);
+            for pair in block.chunks_exact(2) {
+                let (doc, tf) = (pair[0], pair[1]);
+                varint(payload, doc - prev);
+                varint(payload, tf);
+                prev = doc;
+                max_tf = max_tf.max(tf);
+                min_dl = min_dl.min(u32_at(meta, doc as usize * META));
+            }
+            for v in [prev, offset, max_tf, min_dl] {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        buf.extend_from_slice(payload);
+        self.blob.write_all(term)?;
+        self.post.write_all(buf)?;
+        self.idx.write_all(&self.term_off.to_le_bytes())?;
+        self.idx.write_all(&(term.len() as u32).to_le_bytes())?;
+        self.idx.write_all(&((pairs.len() / 2) as u32).to_le_bytes())?;
+        self.idx.write_all(&self.post_off.to_le_bytes())?;
+        self.idx.write_all(&(buf.len() as u32).to_le_bytes())?;
+        self.term_off += term.len() as u64;
+        self.post_off += buf.len() as u64;
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.blob.flush()?;
+        self.idx.flush()?;
+        self.post.flush()?;
+        fs::write(self.dir.join("terms.sample"), encode_sample(&self.sample_at, &self.sample))
+    }
+}
+
+/// Writes one segment at `dir` holding every doc of `sources`, in order: doc d of the i-th source
+/// becomes doc d + (docs in the sources before it). Tombstoned docs are kept and stay tombstoned,
+/// so document frequencies, lengths and tie-breaks, and with them every result, are unchanged.
+/// Reads each source front to back; memory is one term's postings plus the docmeta. Returns the
+/// number of docs written.
+pub fn merge(dir: &Path, sources: &[PathBuf]) -> io::Result<u32> {
+    fs::create_dir_all(dir)?;
+    let segs = sources.iter().map(|p| Segment::open(p)).collect::<io::Result<Vec<_>>>()?;
+    let mut base = Vec::with_capacity(segs.len());
+    let (mut n_docs, mut total_len) = (0u32, 0u64);
+    for s in &segs {
+        base.push(n_docs);
+        n_docs = n_docs.checked_add(s.n_docs).ok_or_else(|| io::Error::other("merged segment would exceed 2^32 docs"))?;
+        total_len += s.total_len;
+        for m in [&s.terms, &s.idx, &s.postings] {
+            let _ = m.advise(Advice::Sequential);
+        }
+    }
+
+    let meta: Vec<u8> = segs.iter().flat_map(|s| s.meta.iter().copied()).collect();
+    let deleted: Vec<u32> = segs
+        .iter()
+        .zip(&base)
+        .flat_map(|(s, &b)| s.deleted.iter().enumerate().filter(|(_, &x)| x).map(move |(d, _)| b + d as u32))
+        .collect();
+    if !deleted.is_empty() {
+        write_tombstones(dir, &deleted)?;
+    }
+
+    let mut store = BufWriter::with_capacity(1 << 20, File::create(dir.join("store.bin"))?);
+    let mut store_idx = BufWriter::with_capacity(1 << 20, File::create(dir.join("store.idx"))?);
+    let mut fingerprints = BufWriter::with_capacity(1 << 20, File::create(dir.join("fingerprints.bin"))?);
+    let mut store_pos = 0u64;
+    for (s, src) in segs.iter().zip(sources) {
+        let _ = s.store.advise(Advice::Sequential);
+        store.write_all(&s.store)?;
+        for o in s.store_idx.chunks_exact(8) {
+            store_idx.write_all(&(u64::from_le_bytes(o.try_into().unwrap()) + store_pos).to_le_bytes())?;
+        }
+        store_pos += s.store.len() as u64;
+        if let Ok(mut f) = File::open(src.join("fingerprints.bin")) {
+            io::copy(&mut f, &mut fingerprints)?;
+        }
+    }
+    store.flush()?;
+    store_idx.flush()?;
+    fingerprints.flush()?;
+
+    // k-way merge of the sorted dictionaries. Ties pop in source order, so docs stay ascending.
+    let mut heap: BinaryHeap<Reverse<(&[u8], usize, usize)>> =
+        segs.iter().enumerate().filter(|(_, s)| s.n_terms > 0).map(|(i, s)| Reverse((s.term(0), i, 0))).collect();
+    let mut dict = DictWriter::create(dir)?;
+    let mut pairs = Vec::new();
+    let (mut docs, mut tfs) = ([0u32; BLOCK], [0u32; BLOCK]);
+    while let Some(Reverse((term, _, _))) = heap.peek().copied() {
+        pairs.clear();
+        while let Some(&Reverse((t, i, ti))) = heap.peek() {
+            if t != term {
+                break;
+            }
+            heap.pop();
+            let p = segs[i].postings_at(ti);
+            for b in 0..p.n_blocks() {
+                let n = p.decode_block(b, &mut docs, &mut tfs);
+                for k in 0..n {
+                    pairs.extend_from_slice(&[base[i] + docs[k], tfs[k]]);
+                }
+            }
+            if ti + 1 < segs[i].n_terms {
+                heap.push(Reverse((segs[i].term(ti + 1), i, ti + 1)));
+            }
+        }
+        dict.add(term, &pairs, &meta)?;
+    }
+    dict.finish()?;
+    fs::write(dir.join("docmeta.bin"), &meta)?;
+    // Written last: a segment without meta.txt is unfinished.
+    fs::write(dir.join("meta.txt"), format!("{n_docs} {total_len} {FORMAT}\n"))?;
+    Ok(n_docs)
 }
 
 pub fn write_tombstones(seg_dir: &Path, docs: &[u32]) -> io::Result<()> {
@@ -425,15 +547,17 @@ impl Segment {
             match self.term(mid).cmp(term.as_bytes()) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => {
-                    let e = mid * ENTRY;
-                    let off = u64_at(&self.idx, e + 16) as usize;
-                    let len = u32_at(&self.idx, e + 24) as usize;
-                    return Some(Postings { df: u32_at(&self.idx, e + 12), data: &self.postings[off..off + len] });
-                }
+                std::cmp::Ordering::Equal => return Some(self.postings_at(mid)),
             }
         }
         None
+    }
+
+    fn postings_at(&self, i: usize) -> Postings<'_> {
+        let e = i * ENTRY;
+        let off = u64_at(&self.idx, e + 16) as usize;
+        let len = u32_at(&self.idx, e + 24) as usize;
+        Postings { df: u32_at(&self.idx, e + 12), data: &self.postings[off..off + len] }
     }
 
     pub fn doc_len(&self, d: u32) -> u32 {

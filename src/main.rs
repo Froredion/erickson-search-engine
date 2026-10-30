@@ -23,6 +23,7 @@ const USAGE: &str = "usage:
   erickson serve   --index DIR [--port 8080]
   erickson query   --index DIR QUERY...
   erickson eval    --index DIR QUERIES_FILE [--exhaustive]
+  erickson merge   --index DIR [--segments 16] [--threads N] [--no-publish] [--keep 2]
   erickson publish --index DIR GENERATION
   erickson stats   --index DIR";
 
@@ -75,6 +76,7 @@ fn main() {
     let r = match argv.first().map(String::as_str) {
         Some("ingest") => ingest::wet(&a),
         Some("ingest-tsv") => ingest::tsv(&a),
+        Some("merge") => ingest::merge(&a),
         Some("bench") => bench(&a),
         Some("serve") => a.index().and_then(|root| {
             let port = a.get("port").and_then(|p| p.parse().ok()).unwrap_or(8080);
