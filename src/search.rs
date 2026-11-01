@@ -446,37 +446,52 @@ impl Index {
                 .collect();
             matched += cs.iter().map(|c| c.p.df as u64).max().unwrap_or(0);
 
+            // Cursors in doc order, as `doc << 32 | index` keys: a cursor holds two decoded blocks,
+            // so sorting the cursors themselves would copy kilobytes on every step. Only the keys
+            // of cursors that moved are refreshed (`moved`), always a prefix of `ord`.
+            let key = |c: &Cursor, i: usize| (c.doc as u64) << 32 | i as u64;
+            let mut ord: Vec<u64> = cs.iter().enumerate().map(|(i, c)| key(c, i)).collect();
+            let mut moved = 0;
             loop {
-                cs.retain(|c| c.doc != u32::MAX);
-                if cs.is_empty() {
+                for k in &mut ord[..moved] {
+                    let i = *k as u32 as usize;
+                    *k = key(&cs[i], i);
+                }
+                ord.sort_unstable();
+                while ord.last().is_some_and(|&k| (k >> 32) as u32 == u32::MAX) {
+                    ord.pop();
+                }
+                if ord.is_empty() {
                     break;
                 }
-                cs.sort_unstable_by_key(|c| c.doc);
+                let at = |n: usize| ord[n] as u32 as usize;
                 // A doc that only ties the threshold can still get in on a lower doc id, so
                 // skipping requires a bound strictly below it.
                 let threshold = if heap.len() < CANDIDATES { 0.0 } else { heap.peek().map_or(0.0, |c: &Cand| c.score) };
 
                 // Pivot: the first position where the terms so far could reach the threshold.
-                // No doc before cs[0].doc is left, so its prior bounds every doc still to come.
-                let prior_max = prior_from(cs[0].doc);
+                // No doc before the first cursor's is left, so its prior bounds every doc still to come.
+                let prior_max = prior_from((ord[0] >> 32) as u32);
                 let (mut max_sum, mut idf_sum, mut pivot) = (0.0, 0.0, None);
-                for (i, c) in cs.iter().enumerate() {
+                for n in 0..ord.len() {
+                    let c = &cs[at(n)];
                     max_sum += c.max_score;
                     idf_sum += c.w;
                     if prior_max * coverage(idf_sum) * max_sum >= threshold {
-                        pivot = Some(i);
+                        pivot = Some(n);
                         break;
                     }
                 }
                 let Some(mut last) = pivot else { break };
-                let d = cs[last].doc;
-                while last + 1 < cs.len() && cs[last + 1].doc == d {
+                let d = (ord[last] >> 32) as u32;
+                while last + 1 < ord.len() && (ord[last + 1] >> 32) as u32 == d {
                     last += 1;
                 }
 
                 // Tighter check with the maxima of the blocks that actually hold `d`.
                 let (mut block_sum, mut idf_sum, mut skip_to) = (0.0, 0.0, u32::MAX);
-                for c in cs[..=last].iter_mut() {
+                for n in 0..=last {
+                    let c = &mut cs[at(n)];
                     let (m, block_last) = c.block_max(d, &bound);
                     block_sum += m;
                     idf_sum += c.w;
@@ -485,22 +500,24 @@ impl Index {
                 if prior_from(d) * coverage(idf_sum) * block_sum < threshold {
                     // Nothing before the end of the shortest of these blocks can make it, and
                     // terms after the pivot haven't reached `d` yet.
-                    if let Some(c) = cs.get(last + 1) {
-                        skip_to = skip_to.min(c.doc);
+                    if let Some(&k) = ord.get(last + 1) {
+                        skip_to = skip_to.min((k >> 32) as u32);
                     }
-                    for c in cs[..=last].iter_mut() {
-                        c.seek(skip_to);
+                    for n in 0..=last {
+                        cs[at(n)].seek(skip_to);
                     }
+                    moved = last + 1;
                     continue;
                 }
 
-                if cs[0].doc == d {
+                if (ord[0] >> 32) as u32 == d {
                     if !seg.is_deleted(d) {
                         // Summed in query-term order, exactly as `score_shards` does, so both
                         // paths produce bit-identical scores.
                         let dl = seg.doc_len(d) as f32;
                         let mut parts = [(0usize, 0.0f32, 0.0f32); 12];
-                        for (slot, c) in parts.iter_mut().zip(&cs[..=last]) {
+                        for (n, slot) in parts[..=last].iter_mut().enumerate() {
+                            let c = &cs[at(n)];
                             *slot = (c.term, c.w * tf_part(c.tf() as f32, dl), c.w);
                         }
                         let parts = &mut parts[..=last];
@@ -513,13 +530,15 @@ impl Index {
                         let score = s * coverage(covered) * page_prior(seg, d);
                         push_top(&mut heap, Cand { score, seg: si as u32, doc: d }, CANDIDATES);
                     }
-                    for c in cs[..=last].iter_mut() {
-                        c.next();
+                    for n in 0..=last {
+                        cs[at(n)].next();
                     }
+                    moved = last + 1;
                 } else {
-                    for c in cs[..last].iter_mut() {
-                        c.seek(d);
+                    for n in 0..last {
+                        cs[at(n)].seek(d);
                     }
+                    moved = last;
                 }
             }
         }
