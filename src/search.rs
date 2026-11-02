@@ -24,6 +24,38 @@ fn bm25_params() -> (f32, f32) {
 /// How many first-stage candidates reach re-ranking.
 const CANDIDATES: usize = 300;
 const PER_HOST: usize = 2;
+/// Long queries (at least this many terms with an IDF) get a reduced first pass, see `first_pass_idf`.
+/// Overridable with ERICKSON_FIRST_MASS / ERICKSON_FIRST_TERMS for tuning runs.
+fn first_pass_params() -> (f32, usize) {
+    static P: std::sync::OnceLock<(f32, usize)> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        let mass = std::env::var("ERICKSON_FIRST_MASS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
+        let terms = std::env::var("ERICKSON_FIRST_TERMS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        (mass, terms)
+    })
+}
+
+/// IDF for the first pass. A long query leaves out its most common terms there, keeping the
+/// rarest ones that together reach FIRST_MASS of its total IDF: their lists are the longest and
+/// they barely move a score. The candidates found are then rescored with every term.
+fn first_pass_idf(idf: &[f32]) -> Vec<f32> {
+    let (mass, min_terms) = first_pass_params();
+    if mass >= 1.0 || idf.iter().filter(|&&w| w > 0.0).count() < min_terms {
+        return idf.to_vec();
+    }
+    let total: f32 = idf.iter().sum();
+    let mut order: Vec<usize> = (0..idf.len()).collect();
+    order.sort_by(|&a, &b| idf[b].total_cmp(&idf[a]).then(a.cmp(&b)));
+    let (mut out, mut kept) = (vec![0.0; idf.len()], 0.0);
+    for i in order {
+        if kept >= mass * total {
+            break;
+        }
+        out[i] = idf[i];
+        kept += idf[i];
+    }
+    out
+}
 const SNIPPET_BYTES: usize = 240;
 
 pub struct Index {
@@ -74,8 +106,9 @@ pub struct Opts {
     /// At most this many results per host.
     pub per_host: Option<usize>,
     pub snippets: bool,
-    /// Score every posting instead of skipping with block-max WAND. Same results, slower; kept
-    /// to check that the skipping never changes an answer.
+    /// Score every posting, with every term, instead of skipping with block-max WAND. Same
+    /// results as the default for queries too short for a reduced first pass (`first_pass_idf`),
+    /// slower; kept to check that the skipping never changes an answer.
     pub exhaustive: bool,
 }
 
@@ -294,6 +327,8 @@ impl Index {
             })
             .collect();
 
+        let first_idf = if opts.exhaustive { idf.clone() } else { first_pass_idf(&idf) };
+
         let (t1, f1) = (t0.elapsed().as_micros(), major_faults());
 
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(self.segs.len());
@@ -302,13 +337,13 @@ impl Index {
             let handles: Vec<_> = (0..self.segs.len())
                 .step_by(chunk)
                 .map(|from| {
-                    let (lists, idf) = (&lists, &idf);
+                    let (lists, idf, first_idf) = (&lists, &idf, &first_idf);
                     let to = (from + chunk).min(self.segs.len());
                     s.spawn(move || {
                         if opts.exhaustive {
                             self.score_shards(from, to, lists, idf, opts.coverage)
                         } else {
-                            self.wand_shards(from, to, lists, idf, opts.coverage)
+                            self.wand_shards(from, to, lists, first_idf, opts.coverage)
                         }
                     })
                 })
@@ -324,12 +359,15 @@ impl Index {
             }
             (heap, matched)
         });
+        let mut cands = heap.into_vec();
+        if first_idf != idf {
+            self.rescore(&mut cands, &lists, &idf, opts.coverage);
+        }
 
         let (t2, f2) = (t0.elapsed().as_micros(), major_faults());
 
         let term_set: HashSet<&str> = terms.iter().map(String::as_str).collect();
-        let mut ranked: Vec<(f32, Cand)> = heap
-            .into_vec()
+        let mut ranked: Vec<(f32, Cand)> = cands
             .into_iter()
             .map(|c| {
                 if !opts.rerank {
@@ -543,6 +581,37 @@ impl Index {
             }
         }
         (heap.into_vec(), matched)
+    }
+
+    /// Exact first-stage scores, with every query term, for candidates a reduced first pass
+    /// found. Summed in query-term order like `score_shards`.
+    fn rescore(&self, cands: &mut [Cand], lists: &[Vec<Option<Postings>>], idf: &[f32], use_coverage: bool) {
+        let total_idf: f32 = idf.iter().sum::<f32>().max(f32::MIN_POSITIVE);
+        let (k1, b) = bm25_params();
+        let avgdl = self.avgdl;
+        let tf_part = |tf: f32, dl: f32| tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * dl / avgdl));
+        let bound = |tf: u32, dl: u32| tf_part(tf as f32, dl as f32);
+        cands.sort_unstable_by_key(|c| (c.seg, c.doc));
+        for run in cands.chunk_by_mut(|a, b| a.seg == b.seg) {
+            let si = run[0].seg as usize;
+            let seg = &self.segs[si];
+            let (mut s, mut covered) = (vec![0.0f32; run.len()], vec![0.0f32; run.len()]);
+            for (term, (&p, &w)) in lists[si].iter().zip(idf).enumerate() {
+                let Some(p) = p.filter(|_| w > 0.0) else { continue };
+                let mut c = Cursor::new(p, term, w, &bound);
+                for (j, cand) in run.iter().enumerate() {
+                    c.seek(cand.doc);
+                    if c.doc == cand.doc {
+                        s[j] += w * tf_part(c.tf() as f32, seg.doc_len(cand.doc) as f32);
+                        covered[j] += w;
+                    }
+                }
+            }
+            for (j, cand) in run.iter_mut().enumerate() {
+                let coverage = if use_coverage { (covered[j] / total_idf).powi(3) } else { 1.0 };
+                cand.score = s[j] * coverage * page_prior(seg, cand.doc);
+            }
+        }
     }
 }
 
