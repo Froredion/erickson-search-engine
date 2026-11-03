@@ -29,7 +29,7 @@ const PER_HOST: usize = 2;
 fn first_pass_params() -> (f32, usize) {
     static P: std::sync::OnceLock<(f32, usize)> = std::sync::OnceLock::new();
     *P.get_or_init(|| {
-        let mass = std::env::var("ERICKSON_FIRST_MASS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
+        let mass = std::env::var("ERICKSON_FIRST_MASS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.6);
         let terms = std::env::var("ERICKSON_FIRST_TERMS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
         (mass, terms)
     })
