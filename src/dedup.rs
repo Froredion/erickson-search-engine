@@ -56,7 +56,11 @@ pub fn run(gen_dir: &Path, threads: usize) -> io::Result<Report> {
     let mut pages = Vec::new();
     for e in fs::read_dir(gen_dir)? {
         let dir = e?.path();
-        let Some(seg) = dir.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("seg-")).and_then(|n| n.parse::<u32>().ok())
+        let Some(seg) = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("seg-"))
+            .and_then(|n| n.parse::<u32>().ok())
         else {
             continue;
         };
@@ -64,7 +68,7 @@ pub fn run(gen_dir: &Path, threads: usize) -> io::Result<Report> {
             continue;
         }
         let Ok(bytes) = fs::read(dir.join("fingerprints.bin")) else { continue };
-        for (doc, r) in bytes.chunks_exact(RECORD).enumerate() {
+        for (doc, r) in bytes.as_chunks::<RECORD>().0.iter().enumerate() {
             let u64_at = |o: usize| u64::from_le_bytes(r[o..o + 8].try_into().unwrap());
             let u32_at = |o: usize| u32::from_le_bytes(r[o..o + 4].try_into().unwrap());
             pages.push(Page {

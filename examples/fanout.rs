@@ -12,6 +12,7 @@
 //!   mean 1 and the given sigma, drawn per node. 0 means every slice is like the measured one.
 //! - jitter is drawn from the measured per-query ratios of scoring time between A and B (the same
 //!   code on two separate machines), split evenly between the two runs.
+//!
 //! The fanned-out query takes the slowest node plus `net` ms for the round trip and merge.
 use std::collections::HashMap;
 use std::fs;

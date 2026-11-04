@@ -218,7 +218,7 @@ impl DictWriter {
 
     /// `pairs` is (doc, weighted tf) flattened, docs ascending; `meta` is the segment's docmeta.
     fn add(&mut self, term: &[u8], pairs: &[u32], meta: &[u8]) -> io::Result<()> {
-        if self.n_terms % SAMPLE == 0 {
+        if self.n_terms.is_multiple_of(SAMPLE) {
             self.sample.extend_from_slice(term);
             self.sample_at.push(self.sample.len() as u32);
         }
@@ -230,7 +230,7 @@ impl DictWriter {
         for block in pairs.chunks(2 * BLOCK) {
             let offset = payload.len() as u32;
             let (mut max_tf, mut min_dl) = (0u32, u32::MAX);
-            for pair in block.chunks_exact(2) {
+            for pair in block.as_chunks::<2>().0 {
                 let (doc, tf) = (pair[0], pair[1]);
                 varint(payload, doc - prev);
                 varint(payload, tf);
@@ -278,7 +278,8 @@ pub fn merge(dir: &Path, sources: &[PathBuf], prior: Option<fn(f32, f32) -> f32>
     let (mut n_docs, mut total_len) = (0u32, 0u64);
     for s in &segs {
         base.push(n_docs);
-        n_docs = n_docs.checked_add(s.n_docs).ok_or_else(|| io::Error::other("merged segment would exceed 2^32 docs"))?;
+        n_docs =
+            n_docs.checked_add(s.n_docs).ok_or_else(|| io::Error::other("merged segment would exceed 2^32 docs"))?;
         total_len += s.total_len;
         for m in [&s.terms, &s.idx, &s.postings] {
             let _ = m.advise(Advice::Sequential);
@@ -286,7 +287,8 @@ pub fn merge(dir: &Path, sources: &[PathBuf], prior: Option<fn(f32, f32) -> f32>
     }
 
     // (source, doc) of every doc in its new order, and the new id of every old one.
-    let mut order: Vec<(u32, u32)> = segs.iter().enumerate().flat_map(|(i, s)| (0..s.n_docs).map(move |d| (i as u32, d))).collect();
+    let mut order: Vec<(u32, u32)> =
+        segs.iter().enumerate().flat_map(|(i, s)| (0..s.n_docs).map(move |d| (i as u32, d))).collect();
     if let Some(prior) = prior {
         let key = |&(i, d): &(u32, u32)| {
             let s = &segs[i as usize];
@@ -299,12 +301,19 @@ pub fn merge(dir: &Path, sources: &[PathBuf], prior: Option<fn(f32, f32) -> f32>
         new_id[(base[i as usize] + d) as usize] = n as u32;
     }
 
-    let meta: Vec<u8> = order.iter().flat_map(|&(i, d)| {
-        let o = d as usize * META;
-        segs[i as usize].meta[o..o + META].iter().copied()
-    }).collect();
-    let mut deleted: Vec<u32> =
-        order.iter().enumerate().filter(|(_, &(i, d))| segs[i as usize].deleted[d as usize]).map(|(n, _)| n as u32).collect();
+    let meta: Vec<u8> = order
+        .iter()
+        .flat_map(|&(i, d)| {
+            let o = d as usize * META;
+            segs[i as usize].meta[o..o + META].iter().copied()
+        })
+        .collect();
+    let mut deleted: Vec<u32> = order
+        .iter()
+        .enumerate()
+        .filter(|(_, &(i, d))| segs[i as usize].deleted[d as usize])
+        .map(|(n, _)| n as u32)
+        .collect();
     deleted.sort_unstable();
     if !deleted.is_empty() {
         write_tombstones(dir, &deleted)?;
@@ -394,7 +403,7 @@ fn encode_sample(at: &[u32], bytes: &[u8]) -> Vec<u8> {
 fn decode_sample(b: &[u8]) -> Option<(Vec<u32>, Vec<u8>)> {
     let n = u32_at(b.get(..4)?, 0) as usize;
     let end = 4 + 4 * (n + 1);
-    let at: Vec<u32> = b.get(4..end)?.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let at: Vec<u32> = b.get(4..end)?.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
     let bytes = b.get(end..)?.to_vec();
     (at.last().copied() == Some(bytes.len() as u32)).then_some((at, bytes))
 }
@@ -505,8 +514,8 @@ impl Segment {
         let mut deleted = vec![false; n_docs as usize];
         let mut n_deleted = 0;
         if let Ok(bytes) = fs::read(dir.join("deleted.bin")) {
-            for c in bytes.chunks_exact(4) {
-                let d = u32::from_le_bytes(c.try_into().unwrap()) as usize;
+            for c in bytes.as_chunks::<4>().0 {
+                let d = u32::from_le_bytes(*c) as usize;
                 if d < deleted.len() && !deleted[d] {
                     deleted[d] = true;
                     n_deleted += 1;

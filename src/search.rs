@@ -306,7 +306,13 @@ impl Index {
         let f0 = major_faults();
         let terms = query_terms(q);
         if terms.is_empty() || self.segs.is_empty() {
-            return Results { hits: Vec::new(), matched: 0, micros: t0.elapsed().as_micros(), phase_micros: [0; 3], phase_faults: [0; 3] };
+            return Results {
+                hits: Vec::new(),
+                matched: 0,
+                micros: t0.elapsed().as_micros(),
+                phase_micros: [0; 3],
+                phase_faults: [0; 3],
+            };
         }
 
         // Each term is looked up once per shard; IDF and scoring both use the result.
@@ -404,12 +410,25 @@ impl Index {
             }
         }
         let (t3, f3) = (t0.elapsed().as_micros(), major_faults());
-        Results { hits, matched, micros: t3, phase_micros: [t1, t2 - t1, t3 - t2], phase_faults: [f1 - f0, f2 - f1, f3 - f2] }
+        Results {
+            hits,
+            matched,
+            micros: t3,
+            phase_micros: [t1, t2 - t1, t3 - t2],
+            phase_faults: [f1 - f0, f2 - f1, f3 - f2],
+        }
     }
 
     /// First stage: field-weighted BM25 × term coverage × static page prior, over shards `from..to`.
     /// Coverage is weighted by IDF, so missing "faucet" costs far more than missing "how".
-    fn score_shards(&self, from: usize, to: usize, lists: &[Vec<Option<Postings>>], idf: &[f32], use_coverage: bool) -> (Vec<Cand>, u64) {
+    fn score_shards(
+        &self,
+        from: usize,
+        to: usize,
+        lists: &[Vec<Option<Postings>>],
+        idf: &[f32],
+        use_coverage: bool,
+    ) -> (Vec<Cand>, u64) {
         let mut heap = BinaryHeap::with_capacity(CANDIDATES + 1);
         let mut matched = 0u64;
         let (mut acc, mut covered, mut touched) = (Vec::<f32>::new(), Vec::<f32>::new(), Vec::<u32>::new());
@@ -462,7 +481,14 @@ impl Index {
     ///
     /// `matched` is a lower bound here (the largest single-term df per shard), since skipped docs
     /// are never counted.
-    fn wand_shards(&self, from: usize, to: usize, lists: &[Vec<Option<Postings>>], idf: &[f32], use_coverage: bool) -> (Vec<Cand>, u64) {
+    fn wand_shards(
+        &self,
+        from: usize,
+        to: usize,
+        lists: &[Vec<Option<Postings>>],
+        idf: &[f32],
+        use_coverage: bool,
+    ) -> (Vec<Cand>, u64) {
         let mut heap = BinaryHeap::with_capacity(CANDIDATES + 1);
         let mut matched = 0u64;
         let total_idf: f32 = idf.iter().sum::<f32>().max(f32::MIN_POSITIVE);
@@ -684,7 +710,7 @@ fn min_span(title: &str, text: &str, terms: &[String]) -> Option<usize> {
         count[ti] += 1;
         while have == terms.len() {
             let span = hits[hi].0 - hits[lo].0 + 1;
-            if best.map_or(true, |b| span < b) {
+            if best.is_none_or(|b| span < b) {
                 best = Some(span);
             }
             let tl = hits[lo].1;
@@ -795,4 +821,91 @@ fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{prior, Index, Opts};
+    use crate::segment::{self, SegmentWriter};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// Writes `segs` segments of random pages over a small Zipf-shaped vocabulary, so common words
+    /// have postings across many blocks and rare ones only a few, and publishes them as gen-0001.
+    /// With `merged`, also merges them into one prior-ordered segment as gen-0002, like `merge`.
+    fn build(root: &Path, segs: u32, docs: u32, merged: bool) -> Index {
+        let _ = fs::remove_dir_all(root);
+        let words: Vec<String> = (0..300).map(|i| format!("w{i}")).collect();
+        let weights: Vec<f64> = (0..words.len()).map(|i| 1.0 / (i + 1) as f64).collect();
+        let total: f64 = weights.iter().sum();
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let gen1 = root.join("gen-0001");
+        let mut dirs = Vec::new();
+        for s in 0..segs {
+            let dir = gen1.join(segment::seg_name(s));
+            let mut w = SegmentWriter::create(&dir).unwrap();
+            for d in 0..docs {
+                let len = 20 + (next() * 180.0) as usize;
+                let mut pick = || {
+                    let mut r = next() * total;
+                    let i = weights
+                        .iter()
+                        .position(|&p| {
+                            r -= p;
+                            r <= 0.0
+                        })
+                        .unwrap_or(words.len() - 1);
+                    words[i].as_str()
+                };
+                let text: Vec<&str> = (0..len).map(|_| pick()).collect();
+                let title: Vec<&str> = (0..4).map(|_| pick()).collect();
+                let url = format!("https://h{}.example/{s}/{d}", (next() * 500.0) as u32);
+                w.add(&url, &title.join(" "), &text.join(" "), 0.3 + 0.7 * next() as f32, next() as f32).unwrap();
+            }
+            w.finish().unwrap();
+            dirs.push(dir);
+        }
+        fs::write(gen1.join("manifest.tsv"), "").unwrap();
+        segment::publish(root, "gen-0001").unwrap();
+        if merged {
+            let gen2 = root.join("gen-0002");
+            segment::merge(&gen2.join(segment::seg_name(0)), &dirs, Some(prior)).unwrap();
+            fs::write(gen2.join("manifest.tsv"), "").unwrap();
+            segment::publish(root, "gen-0002").unwrap();
+        }
+        Index::open(root).unwrap()
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("erickson-test-{name}-{}", std::process::id()))
+    }
+
+    /// Block-max skipping must return exactly what scoring every posting returns, for queries
+    /// short enough to get the full first pass: common words, rare words, and mixes of both.
+    #[test]
+    fn skipping_matches_exhaustive() {
+        let queries =
+            ["w0", "w1 w2", "w0 w1 w2", "w5 w250", "w299", "w3 w40 w120", "w0 w299", "w7 w8 w9 w10", "w100 w101"];
+        for (name, merged) in [("segments", false), ("merged", true)] {
+            let root = tmp(name);
+            let ix = build(&root, 3, 1500, merged);
+            assert_eq!(ix.by_prior.iter().all(|&b| b), merged, "{name}: prior order detected");
+            for q in queries {
+                for offset in [0, 10] {
+                    let fast = ix.search_with(q, 10, offset, Opts::default());
+                    let full = ix.search_with(q, 10, offset, Opts { exhaustive: true, ..Default::default() });
+                    let urls = |r: &super::Results| r.hits.iter().map(|h| h.url.clone()).collect::<Vec<_>>();
+                    assert!(!full.hits.is_empty(), "{name}: {q} found nothing");
+                    assert_eq!(urls(&fast), urls(&full), "{name}: {q} (offset {offset})");
+                }
+            }
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
 }

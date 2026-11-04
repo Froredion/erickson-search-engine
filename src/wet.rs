@@ -64,7 +64,8 @@ impl Iterator for WetReader {
             let mut body = vec![0; len];
             self.r.read_exact(&mut body).ok()?;
             if ty == "conversion" && !uri.is_empty() {
-                let body = String::from_utf8(body).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                let body =
+                    String::from_utf8(body).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                 return Some(Record { uri, lang, body });
             }
         }

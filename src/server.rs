@@ -84,7 +84,8 @@ fn handle(st: &State, req: Request) {
                 return respond(req, 200, body, "application/json");
             }
             let running = st.running.lock().unwrap();
-            let (mut running, wait) = st.slot_freed.wait_timeout_while(running, SLOT_WAIT, |n| *n >= MAX_SEARCHES).unwrap();
+            let (mut running, wait) =
+                st.slot_freed.wait_timeout_while(running, SLOT_WAIT, |n| *n >= MAX_SEARCHES).unwrap();
             if wait.timed_out() {
                 drop(running);
                 return respond(req, 503, error_json("busy, try again in a moment"), "application/json");

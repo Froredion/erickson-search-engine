@@ -76,10 +76,30 @@ pub fn host(url: &str) -> &str {
 /// Platforms where anyone can publish under a subdomain. A site there is its own domain: it must
 /// not inherit the platform's authority.
 const SHARED_HOSTS: [&str; 24] = [
-    "blogspot.com", "github.io", "gitlab.io", "netlify.app", "vercel.app", "lovable.app", "pages.dev",
-    "workers.dev", "wordpress.com", "wixsite.com", "weebly.com", "herokuapp.com", "web.app",
-    "firebaseapp.com", "tumblr.com", "medium.com", "substack.com", "glitch.me", "replit.app",
-    "onrender.com", "fly.dev", "azurewebsites.net", "amazonaws.com", "digitaloceanspaces.com",
+    "blogspot.com",
+    "github.io",
+    "gitlab.io",
+    "netlify.app",
+    "vercel.app",
+    "lovable.app",
+    "pages.dev",
+    "workers.dev",
+    "wordpress.com",
+    "wixsite.com",
+    "weebly.com",
+    "herokuapp.com",
+    "web.app",
+    "firebaseapp.com",
+    "tumblr.com",
+    "medium.com",
+    "substack.com",
+    "glitch.me",
+    "replit.app",
+    "onrender.com",
+    "fly.dev",
+    "azurewebsites.net",
+    "amazonaws.com",
+    "digitaloceanspaces.com",
 ];
 
 /// Registrable domain, approximately: `news.bbc.co.uk` -> `bbc.co.uk`, `a.b.example.com` -> `example.com`.

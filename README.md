@@ -48,8 +48,8 @@ little slower than that, because most of the index is skipped for any one query.
 
 **Projected to 10B pages** (100 nodes of 100M each, from the measurements above, not run): about
 $680 of compute to build, ~$66k/month to serve on demand, and a p99 of roughly 260–300 ms once a
-query has to wait for the slowest of 100 nodes. How that's worked out is in
-[PLAN.md](PLAN.md) and [examples/fanout.rs](examples/fanout.rs).
+query has to wait for the slowest of 100 nodes. How that's worked out, and every
+other measurement, is in [docs/measurements.md](docs/measurements.md).
 
 ## How it works
 

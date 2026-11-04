@@ -1,3 +1,6 @@
+// Segment loops index several per-segment arrays (segs, lists, by_prior) by the same number.
+#![allow(clippy::needless_range_loop)]
+
 mod dedup;
 mod filter;
 mod ingest;
@@ -124,7 +127,13 @@ fn bench(a: &Args) -> io::Result<()> {
         .collect();
     println!("{} judged queries, {} pages in index\n", queries.len(), ix.n_docs);
 
-    let off = search::Opts { coverage: false, rerank: false, per_host: None, snippets: false, exhaustive: a.has("exhaustive") };
+    let off = search::Opts {
+        coverage: false,
+        rerank: false,
+        per_host: None,
+        snippets: false,
+        exhaustive: a.has("exhaustive"),
+    };
     let variants = [
         ("BM25 only", off),
         ("+ coverage", search::Opts { coverage: true, ..off }),
@@ -149,7 +158,12 @@ fn bench(a: &Args) -> io::Result<()> {
         }
         lat.sort_unstable();
         let n = queries.len().max(1) as f64;
-        println!("{name:<18} {:>9.4} {:>9.4} {:>9.1}", ndcg / n, mrr / n, lat.get(lat.len() / 2).copied().unwrap_or(0) as f64 / 1000.0);
+        println!(
+            "{name:<18} {:>9.4} {:>9.4} {:>9.1}",
+            ndcg / n,
+            mrr / n,
+            lat.get(lat.len() / 2).copied().unwrap_or(0) as f64 / 1000.0
+        );
         if let (Some(path), true) = (a.get("run"), vi == variants.len() - 1) {
             fs::write(path, run)?;
         }
@@ -159,7 +173,8 @@ fn bench(a: &Args) -> io::Result<()> {
 
 fn ndcg_at_10(ranked: &[&str], rels: &HashMap<String, u32>) -> f64 {
     let discount = |i: usize| ((i + 2) as f64).log2();
-    let dcg: f64 = ranked.iter().take(10).enumerate().map(|(i, p)| rels.get(*p).copied().unwrap_or(0) as f64 / discount(i)).sum();
+    let dcg: f64 =
+        ranked.iter().take(10).enumerate().map(|(i, p)| rels.get(*p).copied().unwrap_or(0) as f64 / discount(i)).sum();
     let mut ideal: Vec<u32> = rels.values().copied().collect();
     ideal.sort_unstable_by(|a, b| b.cmp(a));
     let idcg: f64 = ideal.iter().take(10).enumerate().map(|(i, &g)| g as f64 / discount(i)).sum();
@@ -218,11 +233,16 @@ fn eval(a: &Args) -> io::Result<()> {
         }
     }
     latencies.sort_unstable();
-    let pct = |p: usize| latencies.get((latencies.len() * p / 100).min(latencies.len().saturating_sub(1))).copied().unwrap_or(0) as f64 / 1000.0;
+    let pct = |p: usize| {
+        latencies.get((latencies.len() * p / 100).min(latencies.len().saturating_sub(1))).copied().unwrap_or(0) as f64
+            / 1000.0
+    };
     let n = latencies.len().max(1);
     let [lookup, first, rest] = phase_micros.map(|us| us as f64 / 1000.0 / n as f64);
     let [fl, ff, fr] = phase_faults.map(|f| f / n as u64);
-    println!("\nmean per query: lookup {lookup:.1} / score {first:.1} / rerank {rest:.1} ms; faults {fl} / {ff} / {fr}");
+    println!(
+        "\nmean per query: lookup {lookup:.1} / score {first:.1} / rerank {rest:.1} ms; faults {fl} / {ff} / {fr}"
+    );
     println!("{} queries: p50 {:.1} ms, p99 {:.1} ms", latencies.len(), pct(50), pct(99));
     Ok(())
 }

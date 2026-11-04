@@ -96,7 +96,11 @@ pub fn wet(a: &Args) -> io::Result<()> {
                         let total = kept.fetch_add(n_kept, Relaxed) + n_kept;
                         let d = done.fetch_add(1, Relaxed) + 1;
                         let secs = t0.elapsed().as_secs_f32();
-                        eprintln!("[{d}/{}] {name} kept {n_kept}/{n_seen}  (total {total}, {:.0} pages/s, {secs:.0}s)", groups.len(), total as f32 / secs);
+                        eprintln!(
+                            "[{d}/{}] {name} kept {n_kept}/{n_seen}  (total {total}, {:.0} pages/s, {secs:.0}s)",
+                            groups.len(),
+                            total as f32 / secs
+                        );
                     }
                     Err(e) => {
                         eprintln!("{name} failed: {e}");
@@ -111,7 +115,12 @@ pub fn wet(a: &Args) -> io::Result<()> {
     if resumed > 0 {
         eprintln!("{resumed} segments were already complete from the interrupted run");
     }
-    eprintln!("indexed {} pages from {} records in {:.0}s", kept.into_inner(), seen.into_inner(), t0.elapsed().as_secs_f32());
+    eprintln!(
+        "indexed {} pages from {} records in {:.0}s",
+        kept.into_inner(),
+        seen.into_inner(),
+        t0.elapsed().as_secs_f32()
+    );
     let failed = failed.into_inner().unwrap();
     if !failed.is_empty() {
         return Err(io::Error::other(format!(
@@ -123,12 +132,24 @@ pub fn wet(a: &Args) -> io::Result<()> {
     if !a.has("no-dedup") {
         let t = Instant::now();
         let r = dedup::run(&tmp, cores())?;
-        eprintln!("dedup: removed {} of {} pages as duplicates ({:.0}s)", r.removed, r.pages, t.elapsed().as_secs_f32());
+        eprintln!(
+            "dedup: removed {} of {} pages as duplicates ({:.0}s)",
+            r.removed,
+            r.pages,
+            t.elapsed().as_secs_f32()
+        );
     }
     end_generation(a, &root, &generation, &tmp)
 }
 
-fn ingest_segment(group: &[Input], dir: &Path, lang: &str, ranks: &Ranks, fetch: &str, work: &Path) -> io::Result<(u64, u64)> {
+fn ingest_segment(
+    group: &[Input],
+    dir: &Path,
+    lang: &str,
+    ranks: &Ranks,
+    fetch: &str,
+    work: &Path,
+) -> io::Result<(u64, u64)> {
     let mut w = SegmentWriter::create(dir)?;
     let mut fingerprints = Vec::new();
     let mut seen = 0;
@@ -153,7 +174,13 @@ fn ingest_segment(group: &[Input], dir: &Path, lang: &str, ranks: &Ranks, fetch:
     Ok((seen, kept))
 }
 
-fn index_file(path: &Path, w: &mut SegmentWriter, fingerprints: &mut Vec<u8>, lang: &str, ranks: &Ranks) -> io::Result<u64> {
+fn index_file(
+    path: &Path,
+    w: &mut SegmentWriter,
+    fingerprints: &mut Vec<u8>,
+    lang: &str,
+    ranks: &Ranks,
+) -> io::Result<u64> {
     let mut seen = 0;
     for rec in wet::open(path)? {
         seen += 1;
@@ -228,7 +255,11 @@ pub fn tsv(a: &Args) -> io::Result<()> {
                 match write_passages(&tmp, seg, &lines) {
                     Ok(n) => {
                         let sum = total.fetch_add(n, Relaxed) + n;
-                        eprintln!("{} done ({sum} passages, {:.0}s)", segment::seg_name(seg), t0.elapsed().as_secs_f32());
+                        eprintln!(
+                            "{} done ({sum} passages, {:.0}s)",
+                            segment::seg_name(seg),
+                            t0.elapsed().as_secs_f32()
+                        );
                     }
                     Err(e) => eprintln!("{} failed: {e}", segment::seg_name(seg)),
                 }
@@ -307,7 +338,12 @@ pub fn merge(a: &Args) -> io::Result<()> {
                 let g = next.fetch_add(1, Relaxed);
                 let Some(group) = groups.get(g) else { break };
                 match segment::merge(&tmp.join(segment::seg_name(g as u32)), group, prior) {
-                    Ok(n) => eprintln!("{} done ({} segments, {n} docs, {:.0}s)", segment::seg_name(g as u32), group.len(), t0.elapsed().as_secs_f32()),
+                    Ok(n) => eprintln!(
+                        "{} done ({} segments, {n} docs, {:.0}s)",
+                        segment::seg_name(g as u32),
+                        group.len(),
+                        t0.elapsed().as_secs_f32()
+                    ),
                     Err(e) => {
                         eprintln!("{} failed: {e}", segment::seg_name(g as u32));
                         failed.lock().unwrap().get_or_insert(e);
@@ -351,11 +387,8 @@ fn begin_generation(root: &Path, resume: bool) -> io::Result<(String, PathBuf)> 
 /// Writes the manifest, moves the staging directory into place, then (unless `--no-publish`)
 /// publishes it and deletes all but the newest `--keep` generations (default 2).
 fn end_generation(a: &Args, root: &Path, generation: &str, tmp: &Path) -> io::Result<()> {
-    let mut segs: Vec<PathBuf> = fs::read_dir(tmp)?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.join("meta.txt").exists())
-        .collect();
+    let mut segs: Vec<PathBuf> =
+        fs::read_dir(tmp)?.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.join("meta.txt").exists()).collect();
     segs.sort();
     let mut manifest = String::new();
     for p in segs {

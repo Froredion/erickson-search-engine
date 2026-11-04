@@ -10,9 +10,8 @@ const MAX_TOKEN_BYTES: usize = 40;
 /// Common English function words. Indexed (so "the who" still works) but dropped from queries
 /// that have other terms: they barely affect ranking and cost the most to score.
 const STOPWORDS: [&str; 33] = [
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it", "no", "not",
-    "of", "on", "or", "such", "that", "the", "their", "then", "there", "these", "they", "this", "to", "was",
-    "will", "with",
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it", "no", "not", "of",
+    "on", "or", "such", "that", "the", "their", "then", "there", "these", "they", "this", "to", "was", "will", "with",
 ];
 
 /// Calls `f(start, end, token)` for every token, with byte offsets into `text`.
