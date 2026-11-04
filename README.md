@@ -70,3 +70,7 @@ deployment only changes how many segments there are and where they live.
 
 The libraries this builds on are listed in `Cargo.toml`; their license texts are in
 [LICENSES/](LICENSES).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
