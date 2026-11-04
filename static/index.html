@@ -29,8 +29,8 @@
   input:focus { border-color: var(--accent); }
   #meta { color: var(--muted); font-size: 13px; margin: 8px 0 20px; min-height: 1em; }
   .hit { margin: 0 0 26px; }
-  .hit .url { color: var(--url); font-size: 13px; overflow-wrap: anywhere; }
-  .hit a { color: var(--link); font-size: 19px; text-decoration: none; display: block; }
+  .hit .url { color: var(--url); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hit a { color: var(--link); font-size: 19px; text-decoration: none; display: block; overflow-wrap: anywhere; }
   .hit a:hover { text-decoration: underline; }
   .hit p { margin: 4px 0 0; color: var(--fg); font-size: 14.5px; overflow-wrap: anywhere; }
   .hit b { font-weight: 650; }
@@ -39,14 +39,26 @@
   nav button { font: inherit; padding: 8px 16px; border-radius: 999px; border: 1px solid var(--line);
                background: var(--field); color: var(--fg); cursor: pointer; }
   nav button:disabled { opacity: .4; cursor: default; }
-  #stats { color: var(--muted); font-size: 13px; }
+  #stats { color: var(--muted); font-size: 13px; text-align: center; }
+  #meta.error { color: #c0392b; }
+  @media (max-width: 520px) {
+    header { padding-top: 22vh; }
+    h1 { font-size: 34px; }
+    body.has-results header { padding: 14px 0 4px; gap: 10px; }
+    body.has-results h1 { font-size: 18px; }
+    input { padding: 10px 14px; }
+    .hit { margin-bottom: 22px; }
+    .hit a { font-size: 17px; }
+    nav { justify-content: space-between; }
+    nav button { flex: 1; padding: 12px; }
+  }
 </style>
 </head>
 <body>
 <main>
   <header>
     <h1 id="logo">Erickson</h1>
-    <form id="f"><input id="q" name="q" autocomplete="off" autofocus placeholder="Search the web" aria-label="Search"></form>
+    <form id="f"><input id="q" name="q" type="search" enterkeyhint="search" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus placeholder="Search the web" aria-label="Search"></form>
   </header>
   <div id="stats"></div>
   <div id="meta"></div>
@@ -55,7 +67,7 @@
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let page = 0;
+let page = 0, latest = 0;
 
 async function run(q, p, push) {
   page = p;
@@ -64,7 +76,21 @@ async function run(q, p, push) {
   $("stats").textContent = "";
   if (push) history.pushState(null, "", `?q=${encodeURIComponent(q)}${p ? `&page=${p}` : ""}`);
   document.title = `${q} - Erickson Search`;
-  const r = await fetch(`/api/search?q=${encodeURIComponent(q)}&page=${p}`).then(r => r.json());
+  const mine = ++latest;
+  $("meta").className = "";
+  $("meta").textContent = "Searching…";
+  let r;
+  try {
+    r = await fetch(`/api/search?q=${encodeURIComponent(q)}&page=${p}`).then(r => r.json());
+  } catch {
+    r = { error: "Couldn't reach the server. Try again." };
+  }
+  if (mine !== latest) return; // a newer search has started
+  if (r.error) {
+    $("meta").className = "error";
+    $("meta").textContent = r.error[0].toUpperCase() + r.error.slice(1) + ".";
+    return;
+  }
   $("meta").textContent = `About ${r.matched.toLocaleString()} results (${r.ms.toFixed(1)} ms)`;
   const out = $("results");
   out.replaceChildren();
@@ -87,6 +113,7 @@ async function run(q, p, push) {
   $("prev").disabled = p === 0;
   $("next").disabled = r.results.length < 10;
   window.scrollTo(0, 0);
+  if (push) $("q").blur(); // closes the on-screen keyboard
 }
 
 function fromUrl() {
@@ -105,8 +132,7 @@ fromUrl();
 fetch("/api/stats").then(r => r.json()).then(s => {
   if (!document.body.classList.contains("has-results"))
     $("stats").textContent = `${s.pages.toLocaleString()} pages indexed`;
-  $("stats").style.textAlign = "center";
-});
+}).catch(() => {});
 </script>
 </body>
 </html>

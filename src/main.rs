@@ -20,7 +20,7 @@ const USAGE: &str = "usage:
                    (WET_FILES... | --paths wet.paths [--limit N] [--fetch https|s3] [--work DIR])
   erickson ingest-tsv --index DIR [--shard-size 100000] [--threads N] PASSAGES.tsv   (id<TAB>text per line)
   erickson bench   --index DIR --queries QUERIES.tsv --qrels QRELS [--rel 1] [--run OUT.run] [--exhaustive]
-  erickson serve   --index DIR [--port 8080]
+  erickson serve   --index DIR [--bind 127.0.0.1] [--port 8080]
   erickson query   --index DIR QUERY...
   erickson eval    --index DIR QUERIES_FILE [--exhaustive]
   erickson merge   --index DIR [--segments 16] [--keep-order] [--threads N] [--no-publish] [--keep 2]
@@ -80,7 +80,7 @@ fn main() {
         Some("bench") => bench(&a),
         Some("serve") => a.index().and_then(|root| {
             let port = a.get("port").and_then(|p| p.parse().ok()).unwrap_or(8080);
-            server::serve(search::Index::open(&root)?, port)
+            server::serve(search::Index::open(&root)?, a.get("bind").unwrap_or("127.0.0.1"), port)
         }),
         Some("query") => query(&a),
         Some("eval") => eval(&a),
